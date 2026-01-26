@@ -1,0 +1,17 @@
+[
+  {
+   "numero": "DEVIS-0002",
+    "date": "2026-01-22",
+    "client": "",
+    "chantier": "",
+    "fichier": "DEVIS-0002_2026-01-22.xlsx"
+  },
+  { 
+    "numero": "DEVIS-0001",
+    "date": "2026-01-22",
+    "client": "Client",
+    "chantier": "Chantier",
+    "remarques": "",
+    "fichier": "DEVIS-0001_2026-01-22.xlsx"
+  }
+]
