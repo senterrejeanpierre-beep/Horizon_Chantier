@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 
 from openpyxl import load_workbook
 
@@ -684,6 +684,42 @@ class HorizonChantierApp(tk.Tk):
         self._build_ui()
         self.refresh_liste()
 
+    def _nom_chantier_selectionne(self) -> str | None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Chantier", "Sélectionne un chantier dans la liste.")
+            return None
+        vals = self.tree.item(sel[0]).get("values", [])
+        return str(vals[0]).strip() if vals else ""
+
+    def _ouvrir_fichier_chantier(self, nom_fichier: str) -> None:
+        nom_chantier = self._nom_chantier_selectionne()
+        if not nom_chantier:
+            return
+        subprocess.Popen(["open", str(dossier_chantiers() / nom_chantier / nom_fichier)])
+
+    def _ouvrir_premier_fichier_chantier(self, motif: str) -> None:
+        nom_chantier = self._nom_chantier_selectionne()
+        if not nom_chantier:
+            return
+        try:
+            chemin = next((dossier_chantiers() / nom_chantier).glob(motif))
+        except StopIteration:
+            messagebox.showerror("Introuvable", f"Fichier absent :\n{motif}")
+            return
+        subprocess.Popen(["open", chemin.as_posix()])
+
+    def _dossier_depuis_json(self, p: Path) -> Path:
+        try:
+            chantier = lire_json(p)
+            info = infos_chantier(chantier)
+            nom = str(info.get("nom") or "").strip()
+            if nom:
+                return p.parent / nom
+        except Exception:
+            pass
+        return p.parent / p.stem
+
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=18)
         root.pack(fill="both", expand=True)
@@ -768,55 +804,37 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(
             frame_gauche,
             text="🔎 Dossier administratif",
-            command=lambda: __import__("subprocess").run([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Administratif")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Administratif")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_gauche,
             text="📄 Cahier des charges administratif",
-            command=lambda: __import__("subprocess").Popen([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Cahier_administratif.pdf")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Cahier_administratif.pdf")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
            frame_gauche,
             text="🛠 Cahier des charges technique",
-            command=lambda: __import__("subprocess").Popen([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Cahier_technique.pdf")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Cahier_technique.pdf")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_gauche,
             text="📐 Postes / Métré",
-            command=lambda: __import__("subprocess").run([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Metre_detaille.pdf")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Metre_detaille.pdf")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_gauche,
             text="🦺 Plan de sécurité (PSS)",
-            command=lambda: __import__("subprocess").Popen([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "PSS.pdf")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("PSS.pdf")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_gauche,
             text="📄 Décompte intempéries",
-            command=lambda: __import__("subprocess").run([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Décompte_intempéries.doc")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Décompte_intempéries.doc")
         ).pack(fill="x", pady=3)
 
         # -------------------------
@@ -835,10 +853,7 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(
             frame_droite,
             text="📅 Planning d’exécution",
-            command=lambda: __import__("subprocess").Popen([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Planning_execution.xlsx")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Planning_execution.xlsx")
         ).pack(fill="x", pady=3)
 
         ttk.Separator(frame_droite).pack(fill="x", pady=10)
@@ -851,28 +866,19 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(
             frame_droite,
             text="🔎 Coût de la sécurité",
-            command=lambda: __import__("subprocess").Popen([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Cout_securite.xlsx")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("Cout_securite.xlsx")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_droite,
             text="📐 Formule de révision",
-            command=lambda: __import__("subprocess").run([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "Formule_révision.xlsm")
-            ], check=True)
+            command=lambda: self._ouvrir_fichier_chantier("Formule_révision.xlsm")
         ).pack(fill="x", pady=3)
 
         ttk.Button(
             frame_droite,
             text="💰 Prix de revient",
-            command=lambda: __import__("subprocess").run([
-                "open",
-                str(dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0] / "data" / "prix_de_revient.xlsx")
-            ])
+            command=lambda: self._ouvrir_fichier_chantier("data/prix_de_revient.xlsx")
         ).pack(fill="x", pady=3)
 
         ttk.Button(frame_droite, text="🔍 Vérifier PR", command=self.verifier_pr).pack(fill="x", pady=3)
@@ -888,12 +894,7 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(
             frame_droite,
             text="📊 État d'avancement",
-            command=lambda: subprocess.Popen([
-                "open",
-                next(Path(
-                    dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0]
-                ).glob("Etat_avancement*.xlsm")).as_posix()
-            ])
+            command=lambda: self._ouvrir_premier_fichier_chantier("Etat_avancement*.xlsm")
         ).pack(fill="x", pady=3)
 
         ttk.Button(frame_droite, text="📊 Calcul état", command=self.calcul_etat_avancement).pack(fill="x", pady=3)
@@ -1170,9 +1171,12 @@ class HorizonChantierApp(tk.Tk):
         self.ouvrir_aide()
 
     def calcul_etat_avancement(self):
+        nom_chantier = self._nom_chantier_selectionne()
+        if not nom_chantier:
+            return
         chemin = next(
             Path(
-                dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0]
+                dossier_chantiers() / nom_chantier
             ).glob("Etat_avancement*.xlsm")
         ).as_posix()
 
@@ -1290,9 +1294,12 @@ class HorizonChantierApp(tk.Tk):
        
 
     def mise_a_zero_etat(self):
+        nom_chantier = self._nom_chantier_selectionne()
+        if not nom_chantier:
+            return
         chemin = next(
             Path(
-                dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0]
+                dossier_chantiers() / nom_chantier
             ).glob("Etat_avancement*.xlsm")
         ).as_posix()
 
@@ -1456,9 +1463,13 @@ class HorizonChantierApp(tk.Tk):
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
+        nom_chantier = self._nom_chantier_selectionne()
+        if not nom_chantier:
+            return
+
         chemin = next(
             Path(
-                dossier_chantiers() / self.tree.item(self.tree.selection()[0])["values"][0]
+                dossier_chantiers() / nom_chantier
             ).glob("Etat_avancement*.xlsm")
         ).as_posix()
 
@@ -1521,7 +1532,6 @@ class HorizonChantierApp(tk.Tk):
                     return premiere_valeur_a_droite(row, col), row, col
             return 0, None, None
 
-        nom_chantier = self.tree.item(self.tree.selection()[0])['values'][0]
         fichier_prive = (
             "Avenants" in wb.sheetnames
             and "Revision_global" in wb.sheetnames
@@ -2081,11 +2091,10 @@ class HorizonChantierApp(tk.Tk):
                 return 0
 
         try:
-            if not self.tree.selection():
-                messagebox.showwarning("Attention", "Veuillez sélectionner un chantier.")
+            nom_chantier = self._nom_chantier_selectionne()
+            if not nom_chantier:
                 return
 
-            nom_chantier = self.tree.item(self.tree.selection()[0])["values"][0]
             dossier_chantier = dossier_chantiers() / nom_chantier
             fichier_delai = os.path.join(dossier_chantier, "Delai.xlsx")
 
@@ -2621,11 +2630,10 @@ class HorizonChantierApp(tk.Tk):
                 return 0
 
         try:
-            if not self.tree.selection():
-                messagebox.showwarning("Attention", "Veuillez sélectionner un chantier.")
+            nom_chantier = self._nom_chantier_selectionne()
+            if not nom_chantier:
                 return
 
-            nom_chantier = self.tree.item(self.tree.selection()[0])["values"][0]
             dossier_chantier = dossier_chantiers() / nom_chantier
             fichier_delai = os.path.join(dossier_chantier, "Rendement.xlsx")
 
@@ -3135,8 +3143,11 @@ class HorizonChantierApp(tk.Tk):
 
         d = dossier_chantiers()
         fichiers = sorted(d.glob("*.json"))
+        fichiers_illisibles = []
 
         for p in fichiers:
+            if p.stat().st_size == 0:
+                continue
             try:
                 chantier = lire_json(p)
                 info = infos_chantier(chantier)
@@ -3152,63 +3163,33 @@ class HorizonChantierApp(tk.Tk):
                     iid=str(p),
                     values=(info["nom"], info["client"], info["etat"], av_txt, info["debut"], info["fin"]),
                 )
-            except Exception:
+            except Exception as e:
+                fichiers_illisibles.append(f"{p.name} ({e})")
                 continue
+
+        if fichiers_illisibles:
+            messagebox.showwarning(
+                "Chantier",
+                "Fichier chantier illisible :\n" + "\n".join(fichiers_illisibles)
+            )
 
     def _pr_path_and_hint(self) -> tuple[Path, str]:
         p = self._chemin_chantier_selectionne()
         if not p:
             raise ValueError("Sélectionne un chantier dans la liste.")
-        dossier_chantier = p.parent / p.stem
+        dossier_chantier = self._dossier_depuis_json(p)
         pr_path = dossier_chantier / "data" / "prix_de_revient.xlsx"
         if not pr_path.exists():
             raise FileNotFoundError(f"PR introuvable : {pr_path}")
         hint = pr_path.name
         return pr_path, hint
 
-    def importer_bordereau(self) -> None:
-        p = self._chemin_chantier_selectionne()
-        if not p:
-            messagebox.showwarning("Bordereau", "Sélectionne un chantier dans la liste.")
-            return
-
-        try:
-            from app.bordereau import importer_bordereau_vso_xlsx
-        except Exception as e:
-            messagebox.showwarning("Bordereau", f"Import bordereau indisponible.\n{e}")
-            return
-
-        xlsx_path = filedialog.askopenfilename(
-            title="Choisir le bordereau VSO (Excel)",
-            filetypes=[("Excel", "*.xlsx;*.xlsm")],
-        )
-        if not xlsx_path:
-            return
-
-        dossier_chantier = p.parent / p.stem
-        bordereau_xlsx = dossier_chantier / FICHIER_PV
-        try:
-            shutil.copy2(xlsx_path, bordereau_xlsx)
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible de copier le bordereau dans le chantier.\n{e}")
-            return
-
-        try:
-            chantier = lire_json(p)
-            chantier = importer_bordereau_vso_xlsx(xlsx_path, chantier)
-            ecrire_json(p, chantier)
-            self.refresh_liste()
-            afficher_bordereau(self, chantier, "Bordereau (JSON)")
-            messagebox.showinfo("Bordereau", f"Bordereau importé.\nCopie locale: {bordereau_xlsx}")
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Import bordereau impossible.\n{e}")
-
     def prix_revient(self) -> None:
         p = self._chemin_chantier_selectionne()
         if not p:
             messagebox.showwarning("Prix de revient", "Sélectionne un chantier dans la liste.")
             return
-        dossier_chantier = p.parent / p.stem
+        dossier_chantier = self._dossier_depuis_json(p)
         try:
             open_pr(dossier_chantier)
         except Exception as e:
@@ -3225,7 +3206,7 @@ class HorizonChantierApp(tk.Tk):
             subprocess.run(["open", str(pr_path)], check=False)
             time.sleep(0.3)
 
-            items = read_biblio_colA_openpyxl(pr_path, "Bibliothèque_Matière.xlsx")
+            items = read_biblio_colA_openpyxl(pr_path, "Bibliothèque_Matière")
 
             def on_pick(txt: str):
                 target = excel_find_first_empty_cell(hint, "Chiffrage", "P3:P12")
@@ -3429,7 +3410,7 @@ class HorizonChantierApp(tk.Tk):
         if not p:
             messagebox.showwarning("Chantier", "Sélectionne un chantier dans la liste.")
             return
-        ouvrir_dossier(p.parent)
+        ouvrir_dossier(self._dossier_depuis_json(p))
 
     def nouveau_chantier(self) -> None:
         win = tk.Toplevel(self)
