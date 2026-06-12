@@ -112,16 +112,14 @@ def excel_find_first_empty_cell(workbook_hint: str, sheet_name: str, cell_range:
                                 set v to value of c
                                 set f to formula of c
 
-                                if v is missing value then return (address of c) as string
-
-                                try
-                                    if (v as string) is "" then return (address of c) as string
-                                end try
-
-                                -- si formule et résultat vide
                                 try
                                     if (f as string) is not "" then
-                                        if (v as string) is "" then return (address of c) as string
+                                        -- ne jamais proposer une cellule contenant une formule
+                                    else
+                                        if v is missing value then return (address of c) as string
+                                        try
+                                            if (v as string) is "" then return (address of c) as string
+                                        end try
                                     end if
                                 end try
 
@@ -182,6 +180,7 @@ def excel_set_cell_value(workbook_hint: str, sheet_name: str, cell_a1: str, valu
         tell wbRef
             if not (exists worksheet "{sheet_name}") then return
             tell worksheet "{sheet_name}"
+                if ((formula of range "{cell_a1}") as string) is not "" then error "Cellule formule protégée"
                 set value of range "{cell_a1}" to "{safe_val}"
             end tell
         end tell
@@ -405,32 +404,31 @@ def inject_pv(chantier_dir: str | Path) -> int:
     pr_ws = pr_wb["Chiffrage"] if "Chiffrage" in pr_wb.sheetnames else pr_wb.active
 
 
-    # trouver la 1ère ligne d'article à partir de A3
+    # trouver la 1ère ligne d'article à partir de B3
     row_article = None
     for r in range(3, pr_ws.max_row + 1):
-        v = pr_ws.cell(row=r, column=1).value  # colonne A
+        v = pr_ws.cell(row=r, column=2).value  # colonne B
         if v is not None and str(v).strip() != "":
             row_article = r
             break
 
     if row_article is None:
         pr_wb.close()
-        raise ValueError("Aucun ARTICLE trouvé dans la colonne A (à partir de A3).")
+        raise ValueError("Aucun ARTICLE trouvé dans la colonne B (à partir de B3).")
 
-    article = pr_ws.cell(row=row_article, column=1).value
-    designation = pr_ws.cell(row=row_article, column=2).value
+    article = pr_ws.cell(row=row_article, column=2).value
+    designation = pr_ws.cell(row=row_article, column=3).value
 
-    # on garde ton prix comme avant
-    price = pr_ws["E32"].value
+    price = pr_ws["F32"].value
 
     pr_wb.close()
 
 
 
     if article is None or str(article) == "":
-        raise ValueError("ARTICLE vide dans PR (A3).")
+        raise ValueError("ARTICLE vide dans PR (B3).")
     if price is None or str(price) == "":
-        raise ValueError("PRIX vide dans PR (E32).")
+        raise ValueError("PRIX vide dans PR (F32).")
 
     article = str(article)
     designation = "" if designation is None else str(designation)
@@ -1028,7 +1026,7 @@ class HorizonChantierApp(tk.Tk):
 
             ("section", "\n🔍 2. Importer manuellement les fichiers Excel dans le dossier chantier\n"),
             ("liste", "✅ Une fois le chantier créé, copier manuellement dans le dossier chantier les fichiers Excel nécessaires au chantier.\n"),
-            ("liste", "✅ Les fichiers courants sont notamment: prix de revient, état d’avancement, délai, révision, avenants et documents de calcul associés.\n"),
+            ("liste", "✅ Les fichiers courants sont notamment: prix de revient, état d’avancement, délai, avenants et documents de calcul associés.\n"),
             ("liste", "⚠️ Les noms de fichiers et la structure du dossier doivent rester cohérents avec ce que le logiciel attend.\n"),
             ("liste", "❌ Ne pas renommer ou déplacer un fichier utilisé par le logiciel sans raison précise.\n"),
 
@@ -1068,6 +1066,12 @@ class HorizonChantierApp(tk.Tk):
             ("texte", "Le pilotage chantier génère une lecture synthétique du marché, du réalisé, de la production cumulée, du reste à facturer et de l’avancement.\n"),
             ("liste", "✅ À lancer uniquement après encodage correct et recalcul.\n"),
             ("liste", "🔍 Le PDF de pilotage est une sortie de lecture. La source de vérité reste Excel.\n"),
+
+            ("section", "\n📐 Révision des prix\n"),
+            ("texte", "Les révisions concernent essentiellement les marchés publics.\n"),
+            ("liste", "✅ Elles ne sont pas calculées automatiquement par Horizon Chantier.\n"),
+            ("liste", "✅ Elles sont calculées et intégrées manuellement par l’utilisateur selon les règles du marché.\n"),
+            ("liste", "⚠️ Horizon Chantier ne doit pas inventer, rechercher ou recalculer une révision absente.\n"),
 
             ("section", "\n🟪 9. Pilotage délai\n"),
             ("texte", "Le pilotage délai sert à suivre le délai corrigé, le délai consommé, les jours restants et les écarts.\n"),
@@ -1308,12 +1312,58 @@ class HorizonChantierApp(tk.Tk):
         wb = load_workbook(chemin, keep_vba=True)
         ws = wb[feuille]
 
-        ligne = 24
+        def normaliser_libelle(valeur):
+            texte = str(valeur or "").strip().lower()
+            texte = texte.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+            texte = texte.replace("à", "a").replace("â", "a").replace("ä", "a")
+            texte = texte.replace("ù", "u").replace("û", "u").replace("ü", "u")
+            texte = texte.replace("î", "i").replace("ï", "i")
+            texte = texte.replace("ô", "o").replace("ö", "o")
+            texte = texte.replace("ç", "c")
+            texte = texte.replace("\n", " ")
+            texte = re.sub(r"\s+", " ", texte)
+            return texte
 
-        while ligne <= ws.max_row:
+        libelles_synthese = (
+            "total soumission hors tva",
+            "total etat cumule hors tva",
+            "total du mois hors tva",
+            "total des avenants cumule",
+            "montant global a facturer",
+            "total execute",
+        )
+
+        def est_ligne_synthese(ligne):
+            contenu = " ".join(
+                normaliser_libelle(ws.cell(ligne, col).value)
+                for col in range(1, ws.max_column + 1)
+            )
+            return any(libelle in contenu for libelle in libelles_synthese)
+
+        def premiere_ligne_synthese():
+            for ligne in range(24, ws.max_row + 1):
+                if est_ligne_synthese(ligne):
+                    return ligne
+            return ws.max_row + 1
+
+        def ligne_bordereau_a_cloturer(ligne):
+            valeurs = [
+                ws[f"B{ligne}"].value,
+                ws[f"C{ligne}"].value,
+                ws[f"J{ligne}"].value,
+                ws[f"L{ligne}"].value,
+                ws[f"P{ligne}"].value,
+                ws[f"Q{ligne}"].value,
+            ]
+            return any(v not in (None, "", "-", "—") for v in valeurs)
+
+        fin_bordereau = premiere_ligne_synthese() - 1
+
+        for ligne in range(24, fin_bordereau + 1):
+            if not ligne_bordereau_a_cloturer(ligne):
+                continue
             ws[f"P{ligne}"] = ws[f"R{ligne}"].value
             ws[f"Q{ligne}"] = 0
-            ligne += 1
 
         wb.save(chemin)
         self.calcul_etat_avancement()
@@ -1403,50 +1453,7 @@ class HorizonChantierApp(tk.Tk):
         else:
             messagebox.showinfo("PR", "✔ Tous les calculs sont corrects")
 
-        # 🔒 Sécurisation automatique du PR
-        wb = load_workbook(chemin)
-
-        def est_cellule_gris_clair(cell):
-            fill = cell.fill
-            if fill is None or fill.fill_type != "solid":
-                return False
-
-            couleurs_gris_clair = {
-                "FFD9D9D9", "00D9D9D9",
-                "FFDDDDDD", "00DDDDDD",
-                "FFEDEDED", "00EDEDED",
-                "FFF2F2F2", "00F2F2F2",
-                "FFF3F3F3", "00F3F3F3",
-            }
-
-            for couleur in (fill.fgColor, fill.start_color):
-                if getattr(couleur, "type", None) == "rgb":
-                    rgb = (getattr(couleur, "rgb", None) or "").upper()
-                    if rgb in couleurs_gris_clair:
-                        return True
-            return False
-
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                for cell in row:
-                    if cell.__class__.__name__ == "MergedCell":
-                        continue
-
-                    est_formule = (
-                        cell.value is not None
-                        and isinstance(cell.value, str)
-                        and cell.value.startswith("=")
-                    )
-                    est_gris_clair = est_cellule_gris_clair(cell)
-
-                    cell.protection = cell.protection.copy(
-                        locked=not est_gris_clair or est_formule
-                    )
-
-            ws.protection.sheet = True
-            ws.protection.password = "1234"
-
-        wb.save(chemin)
+        wb.close()
 
 
             
@@ -1532,63 +1539,37 @@ class HorizonChantierApp(tk.Tk):
                     return premiere_valeur_a_droite(row, col), row, col
             return 0, None, None
 
-        fichier_prive = (
-            "Avenants" in wb.sheetnames
-            and "Revision_global" in wb.sheetnames
-            and "Révision" in wb.sheetnames
+        montant_soumission, ligne_soumission, col_soumission = valeur_soumission_publique(
+            ["total soumission hors tva"]
+        )
+        _total_etat_cumule, _ligne_etat_cumule, _col_etat_cumule = valeur_soumission_publique(
+            ["total état cumulé hors tva", "total etat cumulé hors tva"]
+        )
+        total_mois, ligne_mois, col_mois = valeur_soumission_publique(
+            ["total du mois hors tva", "total du mois hors tva"]
+        )
+        avenants_plus, _ligne_avenants, _col_avenants = valeur_soumission_publique(
+            ["total des avenants cumulé", "total des avenants cumule"]
+        )
+        total_realise, ligne_execute, col_execute = valeur_soumission_publique(
+            ["total exécuté", "total execute"]
+        )
+        revision, _ligne_revision, _col_revision = valeur_soumission_publique(
+            ["montant de la révision", "montant de la revision"]
+        )
+        _montant_global, _ligne_global, _col_global = valeur_soumission_publique(
+            ["montant global à facturer", "montant global a facturer"]
         )
 
-        if fichier_prive:
-            ws_rev = wb["Révision"]
-            ws_glob = wb["Revision_global"]
+        if "Avenants" in wb.sheetnames:
             ws_avenants = wb["Avenants"]
-
-            revision = nombre(ws_rev["F32"].value)
-            revision_cumulee = nombre(ws_glob["D62"].value)
-
             avenants_plus = nombre(ws_avenants["D62"].value)
             avenants_moins = nombre(ws_avenants["E62"].value)
-
-            ligne_soumission, col_soumission = trouver_ligne_libelle(["soumission", "tva"])
-            ligne_mois, col_mois = trouver_ligne_libelle(["total", "mois", "tva"])
-            ligne_execute, col_execute = trouver_ligne_libelle(["exécuté"])
-
-            if not ligne_execute:
-                ligne_execute, col_execute = trouver_ligne_libelle(["execute"])
-
-            montant_soumission = premiere_valeur_a_droite(ligne_soumission, col_soumission)
-            total_mois = premiere_valeur_a_droite(ligne_mois, col_mois)
-            total_realise = premiere_valeur_a_droite(ligne_execute, col_execute)
             total_marche = nombre(ws_avenants["E65"].value)
         else:
-            montant_soumission, ligne_soumission, col_soumission = valeur_soumission_publique(
-                ["total soumission hors tva"]
-            )
-            _total_etat_cumule, _ligne_etat_cumule, _col_etat_cumule = valeur_soumission_publique(
-                ["total état cumulé hors tva", "total etat cumulé hors tva"]
-            )
-            total_mois, ligne_mois, col_mois = valeur_soumission_publique(
-                ["total du mois hors tva", "total du mois hors tva"]
-            )
-            avenants_plus, _ligne_avenants, _col_avenants = valeur_soumission_publique(
-                ["total des avenants cumulé", "total des avenants cumule"]
-            )
-            total_realise, ligne_execute, col_execute = valeur_soumission_publique(
-                ["total exécuté", "total execute"]
-            )
-            revision_cumulee, _ligne_revision, _col_revision = valeur_soumission_publique(
-                ["total des révision cumulé", "total des revision cumule"]
-            )
-            _montant_global, _ligne_global, _col_global = valeur_soumission_publique(
-                ["montant global à facturer", "montant global a facturer"]
-            )
-
-            revision = 0
             avenants_moins = 0
             total_marche = montant_soumission + avenants_plus - avenants_moins
 
-        print("revision =", revision)
-        print("revision_cumulee =", revision_cumulee)
         print("avenants_plus =", avenants_plus)
         print("avenants_moins =", avenants_moins)
 
@@ -1601,7 +1582,7 @@ class HorizonChantierApp(tk.Tk):
         realise_mois = total_mois
         realise_cumule = total_realise
         production_mois = realise_mois + revision
-        production_cumulee = realise_cumule + revision_cumulee
+        production_cumulee = realise_cumule + revision
         reste_a_facturer = total_marche - production_cumulee
         avancement = 0 if total_marche == 0 else (production_cumulee / total_marche) * 100
 
@@ -1616,10 +1597,9 @@ class HorizonChantierApp(tk.Tk):
     Avenants cumulés en moins       : {avenants_moins:,.2f} €
     Marché total                    : {total_marche:,.2f} €
     Réalisé du mois                 : {realise_mois:,.2f} €
-    Révision du mois                : {revision:,.2f} €
+    Révision renseignée             : {revision:,.2f} €
     Production du mois              : {production_mois:,.2f} €
     Réalisé cumulé                  : {realise_cumule:,.2f} €
-    Révision cumulée                : {revision_cumulee:,.2f} €
     Production cumulée              : {production_cumulee:,.2f} €
     Reste à facturer                : {reste_a_facturer:,.2f} €
     Avancement                      : {avancement:.1f} %
@@ -1858,10 +1838,9 @@ class HorizonChantierApp(tk.Tk):
         bloc_2 = Table([
             ["RÉALISÉ", ""],
             [Paragraph("Réalisé du mois", style_libelle), Paragraph(f"{realise_mois:,.2f} €", style_valeur)],
-            [Paragraph("+ Révision du mois", style_libelle), Paragraph(f"{revision:,.2f} €", style_valeur)],
+            [Paragraph("+ Révision renseignée", style_libelle), Paragraph(f"{revision:,.2f} €", style_valeur)],
             [Paragraph("= Production du mois", style_libelle), Paragraph(f"{production_mois:,.2f} €", style_valeur)],
             [Paragraph("Réalisé cumulé", style_libelle), Paragraph(f"{realise_cumule:,.2f} €", style_valeur)],
-            [Paragraph("+ Révision cumulée", style_libelle), Paragraph(f"{revision_cumulee:,.2f} €", style_valeur)],
             [Paragraph("= Production cumulée", style_libelle), Paragraph(f"{production_cumulee:,.2f} €", style_valeur)],
         ], colWidths=largeur_blocs_gauche)
         bloc_2.hAlign = "CENTER"
@@ -1882,8 +1861,8 @@ class HorizonChantierApp(tk.Tk):
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
             ("BACKGROUND", (0, 3), (1, 3), colors.HexColor("#FFF2CC")),
             ("FONTNAME", (0, 3), (1, 3), "Helvetica-Bold"),
-            ("BACKGROUND", (0, 6), (1, 6), colors.HexColor("#FFF2CC")),
-            ("FONTNAME", (0, 6), (1, 6), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 5), (1, 5), colors.HexColor("#FFF2CC")),
+            ("FONTNAME", (0, 5), (1, 5), "Helvetica-Bold"),
         ]))
 
         bloc_3 = Table([
@@ -3298,7 +3277,6 @@ class HorizonChantierApp(tk.Tk):
 
     def importer_pr_dans_etat(self):
         dossier = self._dossier_chantier_selectionne()
-        chantier_nom = dossier.name.strip().lower()
         chemin_pr = dossier / "data" / "prix_de_revient.xlsx"
 
         try:
@@ -3344,16 +3322,27 @@ class HorizonChantierApp(tk.Tk):
             article = ".".join(parts)
             return article if any(c.isdigit() for c in article) else ""
 
-        def cell_to_float(val):
-            if isinstance(val, (int, float)):
-                return float(val)
-            if val is None:
-                return 0.0
-            txt = str(val).strip().replace("\xa0", " ").replace(" ", "").replace(",", ".")
-            try:
-                return float(txt)
-            except ValueError:
-                return 0.0
+        def normaliser_libelle(val):
+            txt = str(val or "").strip().lower()
+            txt = txt.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+            txt = txt.replace("à", "a").replace("â", "a").replace("ä", "a")
+            txt = txt.replace("ù", "u").replace("û", "u").replace("ü", "u")
+            txt = txt.replace("î", "i").replace("ï", "i")
+            txt = txt.replace("ô", "o").replace("ö", "o")
+            txt = txt.replace("ç", "c")
+            txt = re.sub(r"\s+", " ", txt)
+            return txt
+
+        def est_modele_marche_public():
+            for ligne in range(1, min(ws_etat.max_row, 25) + 1):
+                h = normaliser_libelle(ws_etat[f"H{ligne}"].value)
+                i = normaliser_libelle(ws_etat[f"I{ligne}"].value)
+                j = normaliser_libelle(ws_etat[f"J{ligne}"].value)
+                if "en chiffres" in h and "en lettres" in i and "somme" in j:
+                    return True
+            return False
+
+        marche_public = est_modele_marche_public()
 
         pr_map = {}
         for row in range(3, ws_pr.max_row + 1):
@@ -3374,12 +3363,8 @@ class HorizonChantierApp(tk.Tk):
 
             if article in pr_map:
                 prix = pr_map[article]
-                if chantier_nom == "001_chapelette":
-                    quantite = cell_to_float(ws_etat[f"E{row}"].value)
-                    montant = round(quantite * prix, 2)
+                if marche_public:
                     ws_etat[f"H{row}"] = prix
-                    ws_etat[f"J{row}"] = montant
-                    ws_etat[f"I{row}"] = montant_en_lettres_fr(montant)
                 else:
                     ws_etat[f"L{row}"] = prix
                 nb_importes += 1
