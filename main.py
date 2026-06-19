@@ -6,6 +6,9 @@ import subprocess
 import shutil
 import re
 import time
+import unicodedata
+from copy import copy
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 import sys
@@ -188,6 +191,236 @@ def excel_set_cell_value(workbook_hint: str, sheet_name: str, cell_a1: str, valu
     end tell
     '''
     _osascript(script)
+
+
+def _is_archive_or_history_path(path: Path) -> bool:
+    ignored = {"archives", "archive", "harchives", "harchive", "historique_sauvegardes"}
+    return any(part.lower() in ignored for part in path.parts)
+
+
+def _chantier_root_for_path(path: str | Path) -> Path:
+    src = Path(path).resolve()
+    try:
+        rel = src.relative_to(dossier_chantiers().resolve())
+        if rel.parts:
+            return dossier_chantiers() / rel.parts[0]
+    except Exception:
+        pass
+    return src.parent.parent if src.parent.name == "data" else src.parent
+
+
+def _historique_key(chantier_dir: Path, path: str | Path) -> str:
+    src = Path(path)
+    try:
+        rel = src.relative_to(chantier_dir)
+    except ValueError:
+        rel = Path(src.name)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", "__".join(rel.parts))
+
+
+def _backup_excel_before_write(path: str | Path) -> Path:
+    src = Path(path)
+    chantier_dir = _chantier_root_for_path(src)
+    backup_dir = chantier_dir / "Historique_Sauvegardes"
+    backup_dir.mkdir(exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    key = _historique_key(chantier_dir, src)
+    dst = backup_dir / f"{stamp}_{key}"
+    if dst.exists():
+        i = 2
+        while True:
+            candidate = backup_dir / f"{stamp}_{i}_{key}"
+            if not candidate.exists():
+                dst = candidate
+                break
+            i += 1
+
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _normaliser_libelle_excel(valeur):
+    txt = str(valeur or "").strip().lower()
+    txt = txt.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+    txt = txt.replace("à", "a").replace("â", "a").replace("ä", "a")
+    txt = txt.replace("ù", "u").replace("û", "u").replace("ü", "u")
+    txt = txt.replace("î", "i").replace("ï", "i")
+    txt = txt.replace("ô", "o").replace("ö", "o")
+    txt = txt.replace("ç", "c")
+    txt = re.sub(r"\s+", " ", txt)
+    return txt
+
+
+def _premiere_ligne_synthese_etat(ws) -> int:
+    libelles_synthese = (
+        "total soumission hors tva",
+        "total etat cumule hors tva",
+        "total du mois hors tva",
+        "total des avenants cumule",
+        "montant global a facturer",
+        "total execute",
+        "tva",
+        "revision",
+        "avenant",
+    )
+
+    for ligne in range(24, ws.max_row + 1):
+        contenu = " ".join(
+            _normaliser_libelle_excel(ws.cell(ligne, col).value)
+            for col in range(1, ws.max_column + 1)
+        )
+        if any(libelle in contenu for libelle in libelles_synthese):
+            return ligne
+
+    return ws.max_row + 1
+
+
+def _montant_diminution_avenant(montant: float) -> float:
+    return abs(montant)
+
+
+def _chemin_fichier_chantier(dossier_chantier: Path, nom_fichier: str) -> Path:
+    chemin = dossier_chantier / nom_fichier
+    if dossier_chantier.exists():
+        for candidat in dossier_chantier.iterdir():
+            if candidat.name == nom_fichier:
+                return candidat
+
+        attendu = unicodedata.normalize("NFC", nom_fichier)
+        for candidat in dossier_chantier.iterdir():
+            if unicodedata.normalize("NFC", candidat.name) == attendu:
+                return candidat
+
+    if chemin.exists():
+        return chemin
+
+    return chemin
+
+
+def _lire_synthese_avenants_pilotage(ws, convertir_nombre):
+    avenants_plus = _lire_montant_synthese_colonne(ws, "E", convertir_nombre)
+    avenants_moins = _montant_diminution_avenant(
+        _lire_montant_synthese_colonne(ws, "G", convertir_nombre)
+    )
+    return avenants_plus, avenants_moins
+
+
+def _lire_revision_globale_pilotage(ws, convertir_nombre):
+    return _lire_montant_synthese_colonne(ws, "E", convertir_nombre)
+
+
+def _lire_montant_synthese_colonne(ws, colonne: str, convertir_nombre) -> float:
+    for ligne in range(ws.max_row, 0, -1):
+        valeur = ws[f"{colonne}{ligne}"].value
+        if valeur in (None, "", "-", "—"):
+            continue
+        montant = convertir_nombre(valeur)
+        texte_valeur = str(valeur).strip()
+        if montant != 0 or texte_valeur in {"0", "0,0", "0.0", "0,00", "0.00"}:
+            return montant
+    return 0
+
+
+def _set_cell_protection(cell, locked: bool, hidden: bool = False) -> None:
+    prot = copy(cell.protection)
+    prot.locked = locked
+    prot.hidden = hidden
+    cell.protection = prot
+
+
+def _protect_formula_cells(wb, source_path: str | Path | None = None) -> None:
+    filename = Path(source_path).name.lower() if source_path else ""
+
+    for ws in wb.worksheets:
+        synthese_debut = None
+        if "etat_avancement" in filename and ws.title == "Bordereau":
+            synthese_debut = _premiere_ligne_synthese_etat(ws)
+
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.__class__.__name__ == "MergedCell":
+                    continue
+
+                in_synthese = synthese_debut is not None and cell.row >= synthese_debut
+                has_formula = cell.data_type == "f" or (
+                    isinstance(cell.value, str) and cell.value.startswith("=")
+                )
+
+                if in_synthese:
+                    _set_cell_protection(cell, locked=False, hidden=False)
+                else:
+                    _set_cell_protection(cell, locked=bool(has_formula), hidden=bool(has_formula))
+
+        ws.protection.sheet = True
+        ws.protection.set_password("1234")
+
+
+def _prepare_excel_file_before_write(path: str | Path, keep_vba: bool = False) -> None:
+    _backup_excel_before_write(path)
+    path = Path(path)
+    wb = load_workbook(path, keep_vba=keep_vba or path.suffix.lower() == ".xlsm")
+    _protect_formula_cells(wb, path)
+    wb.save(path)
+    wb.close()
+
+
+def _export_excel_to_pdf(excel_path: str | Path, pdf_path: str | Path) -> None:
+    import xlwings as xw
+
+    excel_path = Path(excel_path).resolve()
+    pdf_path = Path(pdf_path)
+    book = None
+    opened_here = False
+
+    for app in xw.apps:
+        for candidate in app.books:
+            try:
+                if Path(candidate.fullname).resolve() == excel_path:
+                    book = candidate
+                    break
+            except Exception:
+                continue
+        if book is not None:
+            break
+
+    if book is None:
+        book = xw.Book(str(excel_path))
+        opened_here = True
+
+    try:
+        book.to_pdf(str(pdf_path))
+    finally:
+        if opened_here:
+            book.close()
+
+
+def _chemin_classeur_excel_actif() -> Path | None:
+    import xlwings as xw
+
+    apps = []
+    try:
+        apps.append(xw.apps.active)
+    except Exception:
+        pass
+
+    try:
+        for app in xw.apps:
+            if app not in apps:
+                apps.append(app)
+    except Exception:
+        pass
+
+    for app in apps:
+        try:
+            book = app.books.active
+            chemin = Path(book.fullname)
+        except Exception:
+            continue
+        if chemin.suffix.lower() in {".xlsx", ".xlsm", ".xls"} and chemin.exists():
+            return chemin
+
+    return None
 
 
 # =========================
@@ -437,6 +670,7 @@ def inject_pv(chantier_dir: str | Path) -> int:
     price_2d = round(price_f, 2)
     letters = montant_en_lettres_fr(price_2d)
 
+    _backup_excel_before_write(pv_path)
     wb = load_workbook(pv_path)
     ws = wb["PV"] if "PV" in wb.sheetnames else wb.active
 
@@ -461,6 +695,7 @@ def inject_pv(chantier_dir: str | Path) -> int:
 
     ws.cell(row=row_found, column=8).value = letters
 
+    _protect_formula_cells(wb, pv_path)
     wb.save(pv_path)
     wb.close()
     return 1
@@ -483,6 +718,7 @@ def sync_pv_to_copies(chantier_dir: str | Path) -> None:
     src_wb.close()
 
     def _write(target: Path):
+        _backup_excel_before_write(target)
         wb = load_workbook(target)
         ws = wb["PV"] if "PV" in wb.sheetnames else wb.active
 
@@ -493,6 +729,7 @@ def sync_pv_to_copies(chantier_dir: str | Path) -> None:
                     continue
                 cell.value = val
 
+        _protect_formula_cells(wb, target)
         wb.save(target)
         wb.close()
 
@@ -572,10 +809,15 @@ def ouvrir_doc(self, nom_fichier):
         messagebox.showerror("Introuvable", f"Fichier absent :\n{chemin}")
         return
 
+    if not self._preparer_ouverture_document(chemin):
+        return
+
     if sys.platform == "darwin":
         subprocess.run(["open", str(chemin)], check=False)
     elif os.name == "nt":
         os.startfile(str(chemin))
+    if self._doit_rappeler_pdf_historique(chemin):
+        self._planifier_rappel_pdf_historique_ouverture()
 
 def ouvrir_dossier(path: Path) -> None:
     try:
@@ -678,6 +920,9 @@ class HorizonChantierApp(tk.Tk):
         self.title(APP_NAME)
         self.geometry("1400x800")
         self.minsize(1300, 950)
+        self.dernier_fichier_excel_ouvert: Path | None = None
+        self.rappel_pdf_historique_fenetre = None
+        self._rappel_pdf_historique_after_id = None
 
         self._build_ui()
         self.refresh_liste()
@@ -694,7 +939,15 @@ class HorizonChantierApp(tk.Tk):
         nom_chantier = self._nom_chantier_selectionne()
         if not nom_chantier:
             return
-        subprocess.Popen(["open", str(dossier_chantiers() / nom_chantier / nom_fichier)])
+        chemin = _chemin_fichier_chantier(dossier_chantiers() / nom_chantier, nom_fichier)
+        if not chemin.exists():
+            messagebox.showerror("Introuvable", f"Fichier absent :\n{chemin}")
+            return
+        if not self._preparer_ouverture_document(chemin):
+            return
+        subprocess.Popen(["open", str(chemin)])
+        if self._doit_rappeler_pdf_historique(chemin):
+            self._planifier_rappel_pdf_historique_ouverture()
 
     def _ouvrir_premier_fichier_chantier(self, motif: str) -> None:
         nom_chantier = self._nom_chantier_selectionne()
@@ -705,7 +958,11 @@ class HorizonChantierApp(tk.Tk):
         except StopIteration:
             messagebox.showerror("Introuvable", f"Fichier absent :\n{motif}")
             return
+        if not self._preparer_ouverture_document(chemin):
+            return
         subprocess.Popen(["open", chemin.as_posix()])
+        if self._doit_rappeler_pdf_historique(chemin):
+            self._planifier_rappel_pdf_historique_ouverture()
 
     def _dossier_depuis_json(self, p: Path) -> Path:
         try:
@@ -717,6 +974,256 @@ class HorizonChantierApp(tk.Tk):
         except Exception:
             pass
         return p.parent / p.stem
+
+    def _memoriser_fichier_excel(self, chemin: Path, afficher_rappel: bool = True) -> None:
+        if chemin.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+            self.dernier_fichier_excel_ouvert = chemin
+
+    def _preparer_ouverture_document(self, chemin: Path) -> bool:
+        if chemin.is_dir():
+            if not self._dossier_contient_fichier_excel(chemin):
+                return True
+            return self._confirmer_ouverture_document_excel()
+
+        if chemin.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
+            return True
+        if not self._confirmer_ouverture_document_excel():
+            return False
+        self._memoriser_fichier_excel(chemin)
+        return True
+
+    def _dossier_contient_fichier_excel(self, dossier: Path) -> bool:
+        try:
+            return any(
+                fichier.is_file() and fichier.suffix.lower() in {".xlsx", ".xlsm", ".xls"}
+                for fichier in dossier.rglob("*")
+            )
+        except Exception:
+            return False
+
+    def _doit_rappeler_pdf_historique(self, chemin: Path) -> bool:
+        if chemin.is_dir():
+            return self._dossier_contient_fichier_excel(chemin)
+        return chemin.suffix.lower() in {".xlsx", ".xlsm", ".xls"}
+
+    def _planifier_rappel_pdf_historique_ouverture(self) -> None:
+        if self._rappel_pdf_historique_after_id is not None:
+            return
+        self._rappel_pdf_historique_after_id = self.after(1200, self._afficher_rappel_pdf_historique_ouverture)
+
+    def _afficher_rappel_pdf_historique_ouverture(self) -> None:
+        self._rappel_pdf_historique_after_id = None
+        if self.rappel_pdf_historique_fenetre and self.rappel_pdf_historique_fenetre.winfo_exists():
+            self.rappel_pdf_historique_fenetre.lift()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Sauvegarde PDF Historique")
+        win.resizable(False, False)
+        win.geometry("560x340")
+        self.rappel_pdf_historique_fenetre = win
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        cadre = ttk.Frame(win, padding=32)
+        cadre.pack(fill="both", expand=True)
+
+        tk.Label(
+            cadre,
+            text="⚠️",
+            font=("Helvetica", 54, "bold"),
+            fg="#b45309",
+        ).pack(pady=(0, 8))
+        tk.Label(
+            cadre,
+            text="ATTENTION - SAUVEGARDE OBLIGATOIRE",
+            font=("Helvetica", 19, "bold"),
+            wraplength=480,
+            justify="center",
+            fg="#7c2d12",
+        ).pack(pady=(0, 18))
+        tk.Label(
+            cadre,
+            text=(
+                "N'oubliez pas d'enregistrer vos modifications dans Excel.\n\n"
+                "Après vos modifications importantes, créez votre PDF Historique.\n\n"
+                "Ce PDF est votre copie de sécurité en cas de modification ou d'erreur ultérieure."
+            ),
+            font=("Helvetica", 14, "bold"),
+            wraplength=490,
+            justify="center",
+        ).pack(pady=(0, 26))
+
+        def fermer():
+            self.rappel_pdf_historique_fenetre = None
+            win.destroy()
+
+        ttk.Button(cadre, text="✓ OK, j'ai compris", command=fermer).pack()
+
+        win.protocol("WM_DELETE_WINDOW", fermer)
+        win.update_idletasks()
+        largeur_ecran = win.winfo_screenwidth()
+        hauteur_ecran = win.winfo_screenheight()
+        x = self.winfo_rootx() + self.winfo_width() + 16
+        if x + win.winfo_width() > largeur_ecran - 24:
+            x = largeur_ecran - win.winfo_width() - 24
+        y = self.winfo_rooty() + 80
+        if y + win.winfo_height() > hauteur_ecran - 24:
+            y = max(24, hauteur_ecran - win.winfo_height() - 24)
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _confirmer_ouverture_document_excel(self) -> bool:
+        confirmation = tk.BooleanVar(value=False)
+
+        win = tk.Toplevel(self)
+        win.title("Règles de travail obligatoires")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        cadre = ttk.Frame(win, padding=28)
+        cadre.pack(fill="both", expand=True)
+
+        tk.Label(
+            cadre,
+            text="⚠️ ATTENTION - RÈGLES DE TRAVAIL OBLIGATOIRES",
+            font=("Helvetica", 18, "bold"),
+            fg="#7c2d12",
+            wraplength=620,
+            justify="center",
+        ).pack(pady=(0, 18))
+        tk.Label(
+            cadre,
+            text=(
+                "Vous allez ouvrir un document de travail.\n\n"
+                "Avant de continuer, vous confirmez avoir compris les règles suivantes :\n\n"
+                "• Enregistrer votre fichier Excel après chaque modification.\n"
+                "• Créer votre PDF Historique après vos modifications importantes.\n"
+                "• Respecter les cellules protégées et les zones prévues dans les modèles Horizon Chantier."
+            ),
+            font=("Helvetica", 13, "bold"),
+            wraplength=620,
+            justify="left",
+        ).pack(pady=(0, 24))
+
+        def confirmer():
+            confirmation.set(True)
+            win.destroy()
+
+        ttk.Button(
+            cadre,
+            text="✓ J'ai compris - Ouvrir le document",
+            command=confirmer,
+        ).pack()
+
+        win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
+        win.bind("<Escape>", lambda _event: win.destroy())
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.wait_window(win)
+        return confirmation.get()
+
+    def sauvegarde_pdf_historique(self) -> bool:
+        chemin = _chemin_classeur_excel_actif() or self.dernier_fichier_excel_ouvert
+        if not chemin or not chemin.exists():
+            messagebox.showwarning(
+                "Sauvegarde PDF Historique",
+                "Aucun fichier Excel ouvert n'a été trouvé."
+            )
+            return False
+        self._memoriser_fichier_excel(chemin, afficher_rappel=False)
+
+        try:
+            dossier_chantier = _chantier_root_for_path(chemin)
+            historique = dossier_chantier / "Historique_Sauvegardes"
+            historique.mkdir(exist_ok=True)
+
+            nom_source = re.sub(r"\.[^.]+$", "", chemin.name)
+            nom_pdf = f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_{nom_source}.pdf"
+            destination = historique / nom_pdf
+
+            _export_excel_to_pdf(chemin, destination)
+            messagebox.showinfo(
+                "Sauvegarde PDF Historique",
+                f"PDF historique créé :\n{destination}"
+            )
+            return True
+        except Exception as e:
+            messagebox.showerror("Sauvegarde PDF Historique", f"Impossible de créer le PDF.\n{e}")
+            return False
+
+    def _confirmer_cloture_etat(self) -> bool:
+        confirmation = tk.BooleanVar(value=False)
+
+        win = tk.Toplevel(self)
+        win.title("Clôture de l'État")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        cadre = ttk.Frame(win, padding=28)
+        cadre.pack(fill="both", expand=True)
+
+        tk.Label(
+            cadre,
+            text="⚠️",
+            font=("Helvetica", 54, "bold"),
+            fg="#b42318",
+        ).pack(pady=(0, 8))
+        tk.Label(
+            cadre,
+            text="ATTENTION - CLÔTURE IRRÉVERSIBLE",
+            font=("Helvetica", 20, "bold"),
+            fg="#b42318",
+            wraplength=580,
+            justify="center",
+        ).pack(pady=(0, 18))
+        tk.Label(
+            cadre,
+            text=(
+                "Vous allez clôturer l'État d'avancement.\n\n"
+                "Cette opération effectue la mise à zéro des quantités du mois "
+                "et il sera impossible de revenir à l'état précédent.\n\n"
+                "Avez-vous créé votre PDF Historique de sauvegarde ?"
+            ),
+            font=("Helvetica", 13, "bold"),
+            wraplength=590,
+            justify="center",
+        ).pack(pady=(0, 24))
+
+        boutons = ttk.Frame(cadre)
+        boutons.pack(fill="x")
+
+        def annuler():
+            confirmation.set(False)
+            win.destroy()
+
+        def confirmer():
+            confirmation.set(True)
+            win.destroy()
+
+        bouton_annuler = ttk.Button(boutons, text="❌ Annuler", command=annuler)
+        bouton_annuler.pack(side="left")
+        ttk.Button(
+            boutons,
+            text="✅ Oui, j'ai créé mon PDF Historique et je confirme la clôture",
+            command=confirmer,
+        ).pack(side="right", padx=(20, 0))
+
+        win.protocol("WM_DELETE_WINDOW", annuler)
+        bouton_annuler.focus_set()
+        win.bind("<Return>", lambda _event: None)
+        win.bind("<Escape>", lambda _event: annuler())
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.wait_window(win)
+        return confirmation.get()
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=18)
@@ -789,6 +1296,25 @@ class HorizonChantierApp(tk.Tk):
         ttk.Button(frame_gauche, text="✏️ Modifier", command=self.modifier_chantier).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="🗑️ Supprimer", command=self.supprimer_chantier).pack(fill="x", pady=3)
         ttk.Button(frame_gauche, text="🔄 Rafraîchir", command=self.refresh_liste).pack(fill="x", pady=3)
+        tk.Button(
+            frame_gauche,
+            text="Sauvegarde PDF Historique",
+            command=self.sauvegarde_pdf_historique,
+            bg="yellow",
+            background="yellow",
+            fg="black",
+            foreground="black",
+            activebackground="yellow",
+            activeforeground="black",
+            font=("Helvetica", 12, "bold"),
+            relief="raised",
+            bd=2,
+            highlightbackground="yellow",
+            highlightcolor="yellow",
+            highlightthickness=2,
+            padx=8,
+            pady=6,
+        ).pack(fill="x", pady=(6, 4))
 
         ttk.Separator(frame_gauche).pack(fill="x", pady=10)
 
@@ -896,7 +1422,20 @@ class HorizonChantierApp(tk.Tk):
         ).pack(fill="x", pady=3)
 
         ttk.Button(frame_droite, text="📊 Calcul état", command=self.calcul_etat_avancement).pack(fill="x", pady=3)
-        ttk.Button(frame_droite, text="♻️ Clôturer état", command=self.mise_a_zero_etat).pack(fill="x", pady=3)
+        btn_cloturer = tk.Label(
+            frame_droite,
+            text="♻️ Clôturer état",
+            bg="#EF8F8F",
+            fg="black",
+            font=("Helvetica", 14, "bold"),
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=6,
+            cursor="hand2",
+        )
+        btn_cloturer.bind("<Button-1>", lambda _event: self.mise_a_zero_etat())
+        btn_cloturer.pack(fill="x", pady=3)
 
         ttk.Separator(frame_droite).pack(fill="x", pady=10)
 
@@ -964,9 +1503,9 @@ class HorizonChantierApp(tk.Tk):
         choix_aide = ttk.Combobox(
             zone_choix,
             textvariable=aide_var,
-            values=["Mode d’emploi", "Dépannage PR"],
+            values=["Mode d’emploi", "Aide en cas de blocage"],
             state="readonly",
-            width=18,
+            width=24,
         )
         choix_aide.pack(side="left")
 
@@ -1011,144 +1550,355 @@ class HorizonChantierApp(tk.Tk):
         texte.tag_configure("fin", font=("Helvetica", 10, "italic"), foreground="#4F6475", spacing1=8, spacing3=10)
 
         contenu_mode_emploi = [
-            ("titre", "Mode d’emploi complet\n"),
-            ("intro", "Cette fenêtre est prévue pour qu’un collègue perdu clique sur AIDE et sache quoi faire, dans quel ordre, et surtout ce qu’il ne faut jamais modifier.\n"),
-            ("regle", "🎯 RÈGLE PRINCIPALE : si la cellule n’est pas gris clair, on ne touche pas.\n"),
-            ("liste", "⚠️ Une cellule blanche, calculée ou décorative ne doit pas être modifiée.\n"),
-            ("liste", "❌ Ne jamais corriger un résultat en touchant une formule.\n"),
-            ("liste", "✅ En cas de doute: arrêter, enregistrer, fermer Excel si nécessaire, puis relire ce guide.\n"),
+            ("titre", "Mode d’emploi par bouton - Horizon Chantier\n"),
+            ("intro", "Ce guide reprend les boutons exactement comme ils apparaissent dans Horizon Chantier. Lire la section du bouton utilisé.\n"),
+            ("regle", "RÈGLE PRINCIPALE : ne jamais modifier les formules, validations, feuilles, colonnes ou structures des fichiers Excel.\n"),
+            ("section", "\nRègle générale de saisie\n"),
+            ("regle", "Dans tous les fichiers Excel utilisés par Horizon Chantier, les cellules grisées sont les zones de saisie prévues pour l’utilisateur.\n"),
+            ("liste", "✅ L’utilisateur peut uniquement compléter ou modifier ces zones grisées.\n"),
+            ("liste", "❌ Toutes les autres cellules contiennent des calculs, des formules ou des informations générées par le logiciel.\n"),
+            ("liste", "❌ Elles ne doivent jamais être modifiées manuellement.\n"),
+            ("liste", "✅ L’utilisateur n’a pas à contrôler ou corriger les calculs du logiciel.\n"),
+            ("liste", "✅ Il doit uniquement introduire les données demandées dans les zones prévues.\n"),
+            ("attention", "⚠️ Cette règle est une base obligatoire pour utiliser correctement Horizon Chantier.\n"),
 
-            ("section", "\n🧱 1. Créer un chantier\n"),
-            ("liste", "✅ Sélectionner la fonction Nouveau chantier.\n"),
-            ("liste", "✅ Renseigner les informations de base du chantier.\n"),
-            ("liste", "✅ Vérifier que le dossier du chantier a bien été créé.\n"),
-            ("liste", "🔍 Le logiciel a besoin de ce dossier pour retrouver les fichiers Excel et produire les documents ensuite.\n"),
+            ("section", "\nAIDE\n"),
+            ("section", "\nAide / Dépannage\n"),
+            ("texte", "Ouvre cette fenêtre de mode d’emploi et de dépannage.\n"),
 
-            ("section", "\n🔍 2. Importer manuellement les fichiers Excel dans le dossier chantier\n"),
-            ("liste", "✅ Une fois le chantier créé, copier manuellement dans le dossier chantier les fichiers Excel nécessaires au chantier.\n"),
-            ("liste", "✅ Les fichiers courants sont notamment: prix de revient, état d’avancement, délai, avenants et documents de calcul associés.\n"),
-            ("liste", "⚠️ Les noms de fichiers et la structure du dossier doivent rester cohérents avec ce que le logiciel attend.\n"),
-            ("liste", "❌ Ne pas renommer ou déplacer un fichier utilisé par le logiciel sans raison précise.\n"),
+            ("section", "\nGESTION\n"),
+            ("section", "\n📄 Ouvrir dans le logiciel\n"),
+            ("texte", "Ouvre la fiche du chantier sélectionné dans Horizon Chantier.\n"),
+            ("liste", "✅ Sélectionner un chantier dans la liste avant de cliquer.\n"),
+            ("liste", "✅ Utiliser ce bouton pour consulter les informations du chantier dans le logiciel.\n"),
 
-            ("section", "\n🟨 3. Fonctionnement du PR\n"),
-            ("texte", "Le PR est le fichier Prix de revient. Il sert de base pour les prix, les vérifications et certaines injections dans l’état d’avancement.\n"),
-            ("liste", "✅ Ouvrir le PR avec le bouton Prix de revient.\n"),
-            ("liste", "✅ Encoder uniquement dans les cellules gris clair prévues à cet effet.\n"),
-            ("liste", "⚠️ Enregistrer Excel après toute modification.\n"),
-            ("liste", "❌ Ne jamais modifier une formule pour forcer un résultat.\n"),
+            ("section", "\n➕ Nouveau chantier\n"),
+            ("texte", "Crée un nouveau chantier complet avec les documents de travail prévus.\n"),
+            ("liste", "✅ Renseigner le client, le nom du chantier et les informations demandées.\n"),
+            ("liste", "✅ Horizon prépare automatiquement le dossier et les documents du chantier.\n"),
+            ("liste", "❌ Ne pas créer manuellement un dossier chantier à la place du logiciel.\n"),
 
-            ("section", "\n✅ 4. Vérifier PR\n"),
-            ("texte", "Le bouton Vérifier PR sert à contrôler la cohérence des calculs du fichier PR.\n"),
-            ("liste", "✅ À utiliser après encodage et après enregistrement du fichier Excel.\n"),
-            ("liste", "🔍 Si une erreur apparaît, il faut corriger la donnée d’entrée dans le PR, pas le résultat calculé ailleurs.\n"),
-            ("liste", "⚠️ Si Excel est encore ouvert et que les données n’ont pas été enregistrées, la vérification peut porter sur une ancienne version du fichier.\n"),
+            ("section", "\n✏️ Modifier\n"),
+            ("texte", "Permet de modifier les informations générales du chantier sélectionné.\n"),
+            ("liste", "✅ Utiliser ce bouton pour mettre à jour les informations administratives du chantier.\n"),
+            ("liste", "❌ Ne pas utiliser ce bouton pour modifier les fichiers Excel.\n"),
 
-            ("section", "\n🟩 5. Importer PR\n"),
-            ("texte", "Dans Horizon Chantier, l’import PR se fait via le bouton Calcul / Reca.\n"),
-            ("liste", "✅ Ouvrir le PR, encoder ce qui doit l’être, puis enregistrer.\n"),
-            ("liste", "✅ Lancer Vérifier PR si nécessaire.\n"),
-            ("liste", "✅ Ensuite lancer Calcul / Reca pour importer les données utiles du PR et recalculer ce qui doit l’être.\n"),
-            ("liste", "⚠️ Si un fichier est verrouillé ou occupé, fermer Excel puis relancer l’action.\n"),
+            ("section", "\n🗑️ Supprimer\n"),
+            ("texte", "Supprime le chantier sélectionné si l’action est confirmée.\n"),
+            ("liste", "⚠️ À utiliser uniquement si la suppression est réellement voulue.\n"),
+            ("liste", "❌ Ne pas supprimer un chantier actif ou contenant des documents utiles.\n"),
 
-            ("section", "\n🟨 6. Encoder l’état d’avancement\n"),
-            ("liste", "✅ Ouvrir le fichier État d’avancement depuis le bouton prévu.\n"),
-            ("liste", "✅ Encoder uniquement les cellules gris clair prévues pour la période en cours.\n"),
-            ("liste", "✅ Enregistrer le fichier avant de revenir dans Horizon Chantier.\n"),
-            ("liste", "❌ Ne pas écrire dans une cellule calculée pour corriger un total manuellement.\n"),
+            ("section", "\n🔄 Rafraîchir\n"),
+            ("texte", "Recharge la liste des chantiers affichés dans Horizon Chantier.\n"),
+            ("liste", "✅ À utiliser après création, modification ou si un chantier n’apparaît pas immédiatement.\n"),
 
-            ("section", "\n✅ 7. Recalculer\n"),
-            ("texte", "Après encodage, le recalcul permet de mettre à jour les colonnes et montants calculés.\n"),
-            ("liste", "✅ Utiliser Calcul état pour recalculer l’état d’avancement.\n"),
-            ("liste", "✅ Utiliser Clôturer état uniquement quand la période doit être clôturée et reportée dans le cumulé.\n"),
-            ("liste", "⚠️ Si le calcul ne prend pas, vérifier que le fichier Excel est enregistré et, si nécessaire, fermé.\n"),
+            ("section", "\nSauvegarde PDF Historique\n"),
+            ("texte", "Crée le PDF de sécurité du document Excel sur lequel vous venez de travailler.\n"),
+            ("liste", "✅ Ouvrir le fichier Excel du chantier.\n"),
+            ("liste", "✅ Modifier le fichier dans Excel.\n"),
+            ("liste", "✅ Enregistrer le fichier dans Excel.\n"),
+            ("liste", "✅ Revenir dans Horizon Chantier.\n"),
+            ("liste", "✅ Cliquer sur Sauvegarde PDF Historique.\n"),
+            ("liste", "✅ Le PDF est créé dans Historique_Sauvegardes avec la date, l’heure et le nom du document.\n"),
+            ("attention", "⚠️ Si plusieurs fichiers Excel sont ouverts, afficher d’abord le bon document Excel avant de lancer la sauvegarde PDF.\n"),
 
-            ("section", "\n🟦 8. Pilotage chantier\n"),
-            ("texte", "Le pilotage chantier génère une lecture synthétique du marché, du réalisé, de la production cumulée, du reste à facturer et de l’avancement.\n"),
-            ("liste", "✅ À lancer uniquement après encodage correct et recalcul.\n"),
-            ("liste", "🔍 Le PDF de pilotage est une sortie de lecture. La source de vérité reste Excel.\n"),
+            ("section", "\nDOCUMENTS\n"),
+            ("section", "\n📁 Ce chantier\n"),
+            ("texte", "Ouvre le dossier complet du chantier sélectionné.\n"),
+            ("liste", "✅ Cliquer sur Ce chantier.\n"),
+            ("liste", "✅ Choisir le fichier Excel ou document souhaité dans le dossier.\n"),
+            ("liste", "✅ Travailler dans Excel puis enregistrer.\n"),
+            ("liste", "✅ Revenir dans Horizon Chantier et cliquer sur Sauvegarde PDF Historique si le fichier Excel a été modifié.\n"),
 
-            ("section", "\n📐 Révision des prix\n"),
-            ("texte", "Les révisions concernent essentiellement les marchés publics.\n"),
-            ("liste", "✅ Elles ne sont pas calculées automatiquement par Horizon Chantier.\n"),
-            ("liste", "✅ Elles sont calculées et intégrées manuellement par l’utilisateur selon les règles du marché.\n"),
-            ("liste", "⚠️ Horizon Chantier ne doit pas inventer, rechercher ou recalculer une révision absente.\n"),
+            ("section", "\n🔎 Dossier administratif\n"),
+            ("texte", "Ouvre le dossier Administratif du chantier.\n"),
+            ("liste", "✅ Utiliser ce bouton pour accéder aux documents administratifs du chantier.\n"),
 
-            ("section", "\n🟪 9. Pilotage délai\n"),
-            ("texte", "Le pilotage délai sert à suivre le délai corrigé, le délai consommé, les jours restants et les écarts.\n"),
-            ("liste", "✅ Utiliser ce bouton lorsque le fichier délai est à jour et enregistré.\n"),
-            ("liste", "⚠️ Si le résultat paraît faux, vérifier d’abord les données du fichier délai.\n"),
+            ("section", "\n📄 Cahier des charges administratif\n"),
+            ("texte", "Ouvre le fichier Cahier_administratif.pdf du chantier.\n"),
 
-            ("section", "\n✅ 10. Rendement\n"),
-            ("texte", "Le bouton Rendements donne une lecture synthétique du rendement chantier.\n"),
-            ("liste", "✅ Il permet d’évaluer les heures consommées, corrigées, restantes et les écarts utiles au suivi.\n"),
-            ("liste", "🔍 Comme pour les autres documents, le résultat dépend entièrement de la qualité des données Excel de départ.\n"),
+            ("section", "\n🛠 Cahier des charges technique\n"),
+            ("texte", "Ouvre le fichier Cahier_technique.pdf du chantier.\n"),
 
-            ("section", "\n❌ 11. Erreurs fréquentes\n"),
-            ("liste", "❌ Modifier une formule pour corriger rapidement un chiffre.\n"),
-            ("liste", "❌ Encoder dans une cellule qui n’est pas gris clair.\n"),
-            ("liste", "❌ Oublier d’enregistrer Excel avant une vérification, un import ou un calcul.\n"),
-            ("liste", "❌ Lancer plusieurs fois une action sans contrôler les données d’entrée.\n"),
-            ("liste", "❌ Travailler sur le mauvais chantier sélectionné dans la liste.\n"),
-            ("liste", "❌ Croire que le PDF doit être corrigé manuellement alors que la vraie correction doit se faire dans Excel.\n"),
+            ("section", "\n📐 Postes / Métré\n"),
+            ("texte", "Ouvre le fichier Metre_detaille.pdf du chantier.\n"),
 
-            ("section", "\n🆘 12. Quoi faire en cas de problème\n"),
-            ("liste", "🆘 Arrêter les manipulations manuelles hasardeuses.\n"),
-            ("liste", "🔍 Identifier le chantier concerné et le bouton utilisé.\n"),
-            ("liste", "⚠️ Vérifier immédiatement si Excel est ouvert, non enregistré ou verrouillé.\n"),
-            ("liste", "✅ Enregistrer les fichiers Excel puis fermer Excel si le logiciel doit reprendre la main.\n"),
-            ("liste", "✅ Relancer une seule fois l’action.\n"),
-            ("liste", "❌ Si le problème persiste, ne pas toucher aux formules pour forcer le résultat.\n"),
-            ("liste", "🆘 Remonter le problème avec le nom du chantier, l’étape bloquante et le message vu à l’écran.\n"),
+            ("section", "\n🦺 Plan de sécurité (PSS)\n"),
+            ("texte", "Ouvre le fichier PSS.pdf du chantier.\n"),
 
-            ("section", "\n🎯 Rappel final\n"),
-            ("ok", "✅ Bon réflexe: encoder dans les cellules gris clair, enregistrer Excel, puis utiliser Horizon Chantier.\n"),
-            ("danger", "❌ Mauvais réflexe: corriger un total à la main dans une cellule calculée.\n"),
-            ("aide", "🆘 En cas de doute: revenir dans cette aide avant de continuer.\n"),
+            ("section", "\n📄 Décompte intempéries\n"),
+            ("texte", "Ouvre le document Décompte_intempéries.doc du chantier.\n"),
+
+            ("section", "\nEXECUTION\n"),
+            ("section", "\n📅 Planning d’exécution\n"),
+            ("texte", "Ouvre le planning d’exécution du chantier.\n"),
+            ("liste", "✅ Modifier uniquement les zones prévues dans Excel.\n"),
+            ("liste", "✅ Enregistrer puis créer une Sauvegarde PDF Historique si le planning a été modifié.\n"),
+
+            ("section", "\nCALCULS\n"),
+            ("section", "\n🔎 Coût de la sécurité\n"),
+            ("texte", "Ouvre le document de coût de la sécurité du chantier.\n"),
+            ("liste", "✅ Encoder uniquement les zones de saisie prévues.\n"),
+            ("liste", "✅ Enregistrer puis créer une Sauvegarde PDF Historique après modification.\n"),
+
+            ("section", "\n📐 Formule de révision\n"),
+            ("texte", "Ouvre le document de formule de révision du chantier.\n"),
+            ("liste", "✅ Utiliser les zones prévues pour les informations de révision.\n"),
+            ("liste", "❌ Ne pas modifier les formules, la structure ou les protections du document.\n"),
+
+            ("section", "\n💰 Prix de revient\n"),
+            ("texte", "Ouvre le Prix de revient du chantier.\n"),
+            ("liste", "✅ Encoder les informations de PR uniquement dans les zones prévues.\n"),
+            ("liste", "✅ Enregistrer le PR avant Vérifier PR ou Calcul / Reca.\n"),
+            ("liste", "❌ Ne pas modifier les formules, les feuilles de bibliothèque ou les listes déroulantes.\n"),
+
+            ("section", "\n🔍 Vérifier PR\n"),
+            ("texte", "Lance le contrôle du Prix de revient enregistré.\n"),
+            ("liste", "✅ À lancer après avoir enregistré le PR dans Excel.\n"),
+            ("liste", "✅ Si un message apparaît, lire le message et reprendre uniquement les zones de saisie prévues.\n"),
+            ("liste", "❌ Ne pas modifier une formule pour faire disparaître une erreur.\n"),
+
+            ("section", "\n⚙️ Calcul / Reca\n"),
+            ("texte", "Lance la mise à jour prévue par Horizon Chantier à partir des documents enregistrés.\n"),
+            ("liste", "✅ Enregistrer le PR et les fichiers concernés avant de cliquer.\n"),
+            ("liste", "⚠️ Si Excel empêche l’action, enregistrer et fermer le document Excel puis relancer une seule fois.\n"),
+
+            ("section", "\nETAT D'AVANCEMENT\n"),
+            ("section", "\n📊 État d'avancement\n"),
+            ("texte", "Ouvre l’État d’avancement du chantier.\n"),
+            ("liste", "✅ Encoder les avancements et informations métier dans les zones prévues.\n"),
+            ("liste", "✅ La synthèse reste une zone libre pour les ajustements métier prévus.\n"),
+            ("liste", "✅ Enregistrer avant Calcul état ou Clôturer état.\n"),
+
+            ("section", "\n📊 Calcul état\n"),
+            ("texte", "Demande à Horizon Chantier de mettre à jour l’état d’avancement enregistré.\n"),
+            ("liste", "✅ À lancer après avoir enregistré l’état d’avancement dans Excel.\n"),
+            ("liste", "❌ Ne pas modifier les cellules calculées pour forcer un résultat.\n"),
+
+            ("section", "\n♻️ Clôturer état\n"),
+            ("texte", "Clôture l’état d’avancement terminé pour préparer l’état suivant.\n"),
+            ("liste", "✅ À utiliser uniquement lorsque la période est validée.\n"),
+            ("danger", "⚠️⚠️ ATTENTION - OPÉRATION IRRÉVERSIBLE ⚠️⚠️\n"),
+            ("danger", "La fonction Clôturer état réalise une mise à zéro de l’état d’avancement pour préparer l’état suivant.\n"),
+            ("danger", "Avant de lancer la clôture, il est OBLIGATOIRE de créer une Sauvegarde PDF Historique du document.\n"),
+            ("liste", "✅ Vérifier que l’état d’avancement est terminé et enregistré.\n"),
+            ("liste", "✅ Créer une Sauvegarde PDF Historique du document.\n"),
+            ("liste", "✅ Vérifier que le PDF a bien été créé dans le dossier Historique_Sauvegardes.\n"),
+            ("liste", "✅ Seulement après cette vérification, lancer le bouton Clôturer état.\n"),
+            ("danger", "Si la clôture est réalisée sans PDF Historique : les quantités du mois sont remises à zéro, l’état précédent n’est plus récupérable sous sa forme de travail, et il est impossible de revenir en arrière.\n"),
+            ("danger", "RÈGLE ABSOLUE : aucune clôture ne doit être réalisée sans cette sauvegarde préalable.\n"),
+
+            ("section", "\nPILOTAGE\n"),
+            ("section", "\n🧭 Pilotage\n"),
+            ("texte", "Affiche ou génère la synthèse de pilotage du chantier.\n"),
+            ("liste", "✅ À lancer après enregistrement et calcul des fichiers concernés.\n"),
+
+            ("section", "\n📊 Pilotage délai\n"),
+            ("texte", "Affiche ou génère la synthèse du délai chantier.\n"),
+            ("liste", "✅ Vérifier que le fichier délai ou planning est à jour avant de cliquer.\n"),
+
+            ("section", "\n⏱ Rendements\n"),
+            ("texte", "Affiche ou génère la lecture des rendements du chantier.\n"),
+            ("liste", "✅ Vérifier que les données de rendement sont enregistrées avant de cliquer.\n"),
+
+            ("section", "\nRègles définitives sur les fichiers Excel\n"),
+            ("liste", "❌ Ne pas modifier la structure des modèles Excel.\n"),
+            ("liste", "❌ Ne pas modifier les formules.\n"),
+            ("liste", "❌ Ne pas modifier les validations de données ou listes déroulantes.\n"),
+            ("liste", "❌ Ne pas renommer les feuilles.\n"),
+            ("liste", "✅ Les cellules de calcul doivent être préservées.\n"),
+            ("liste", "✅ Les zones de saisie prévues par le logiciel sont les seules zones à modifier.\n"),
+            ("liste", "✅ Respecter les zones de saisie prévues garantit une utilisation correcte du logiciel.\n"),
+
+            ("section", "\nBon réflexe de fin de travail Excel\n"),
+            ("ok", "✅ Enregistrer Excel.\n"),
+            ("ok", "✅ Revenir dans Horizon Chantier.\n"),
+            ("ok", "✅ Cliquer sur Sauvegarde PDF Historique.\n"),
+            ("ok", "✅ Vérifier que le PDF daté est présent dans Historique_Sauvegardes.\n"),
+            ("danger", "❌ Ne jamais attendre plusieurs jours avant de créer le PDF Historique d’un document important.\n"),
             ("fin", "\nFin du mode d’emploi.\n"),
         ]
 
-        contenu_depannage_pr = [
-            ("titre", "PR (PRIX DE REVIENT) - FORMULES & DÉPANNAGE\n"),
-            ("intro", "Cette aide rappelle les formules clés du PR et les points de contrôle à ne jamais casser.\n"),
-            ("regle", "RÈGLE : Si la cellule n’est pas gris clair → TU NE TOUCHES PAS\n"),
+        contenu_depannage_complet = [
+            ("titre", "Aide en cas de blocage - Horizon Chantier\n"),
+            ("intro", "Cette aide indique quoi faire si une action ne se passe pas comme prévu. L’utilisateur vérifie les étapes de base et demande de l’aide si le problème continue.\n"),
+            ("regle", "RÈGLE : en cas de blocage, ne jamais modifier une formule, une structure Excel ou un fichier modèle.\n"),
 
-            ("section", "\nMATIÈRE (P13)\n"),
-            ("formule", "=SIERREUR(SOMME(P3:P11)/P12;0)\n"),
+            ("section", "\n📄 Ouvrir dans le logiciel\n"),
+            ("liste", "✅ Si rien ne s’ouvre, vérifier qu’un chantier est sélectionné dans la liste.\n"),
+            ("liste", "✅ Cliquer sur Rafraîchir puis réessayer.\n"),
+            ("liste", "✅ Si le problème continue, noter le nom du chantier et demander de l’aide.\n"),
 
-            ("section", "\nMAIN-D’ŒUVRE (P26)\n"),
-            ("formule", "=SIERREUR(SOMME(P16:P24)/P25;0)\n"),
+            ("section", "\n➕ Nouveau chantier\n"),
+            ("liste", "✅ Si le chantier existe déjà, choisir un autre nom ou vérifier le dossier existant.\n"),
+            ("liste", "✅ Si la création échoue, noter le message affiché.\n"),
+            ("liste", "❌ Ne pas créer manuellement un dossier chantier pour contourner l’erreur.\n"),
 
-            ("section", "\nRÉCAPITULATIF\n"),
-            ("formule", "C28 = P13\n"),
-            ("formule", "C29 = P26\n"),
-            ("formule", "C30 = C28 + C29\n"),
+            ("section", "\n✏️ Modifier\n"),
+            ("liste", "✅ Vérifier qu’un chantier est sélectionné.\n"),
+            ("liste", "✅ Modifier uniquement les informations générales demandées par la fenêtre.\n"),
 
-            ("section", "\nPRIX DE VENTE\n"),
-            ("formule", "J28 = C30 * F28\n"),
-            ("formule", "J29 = (C30 + J28) * F29\n"),
-            ("formule", "F30 = C30 + J28 + J29\n"),
-            ("formule", "F32 = F30 * (1 + F31)\n"),
+            ("section", "\n🗑️ Supprimer\n"),
+            ("liste", "⚠️ Vérifier que le bon chantier est sélectionné avant confirmation.\n"),
+            ("liste", "❌ Ne pas supprimer un chantier actif ou non sauvegardé.\n"),
 
-            ("section", "\nLISTES DÉROULANTES\n"),
-            ("texte", "Si la flèche disparaît :\n"),
-            ("liste", "1. Données\n"),
-            ("liste", "2. Validation des données\n"),
-            ("liste", "3. Autoriser : Liste\n"),
-            ("texte", "\nSource :\n"),
-            ("formule", "Matière -> Bibliothèque_Matière!A2:A500\n"),
-            ("formule", "Main d’œuvre -> Bibliothèque_MainOeuvre!A2:A500\n"),
+            ("section", "\n🔄 Rafraîchir\n"),
+            ("liste", "✅ À utiliser si un chantier n’apparaît pas ou si la liste semble ancienne.\n"),
+            ("liste", "✅ Si le chantier reste absent, demander de l’aide avec le nom exact du chantier.\n"),
 
-            ("section", "\nIMPORTANT\n"),
-            ("danger", "Ne jamais modifier les formules\n"),
-            ("fin", "\nFin de l’aide PR.\n"),
+            ("section", "\nSauvegarde PDF Historique\n"),
+            ("liste", "✅ Vérifier qu’un fichier Excel est ouvert.\n"),
+            ("liste", "✅ Si plusieurs classeurs sont ouverts, afficher le bon document Excel avant de revenir dans Horizon.\n"),
+            ("liste", "✅ Enregistrer le fichier dans Excel avant de créer le PDF.\n"),
+            ("liste", "✅ Vérifier que le PDF apparaît dans Historique_Sauvegardes du chantier.\n"),
+            ("liste", "⚠️ Si Excel affiche une fenêtre, la lire et la fermer correctement avant de relancer la sauvegarde PDF.\n"),
+            ("liste", "❌ Ne pas déplacer ou renommer le fichier Excel pendant la génération du PDF.\n"),
+
+            ("section", "\n📁 Ce chantier\n"),
+            ("liste", "✅ Vérifier qu’un chantier est bien sélectionné dans la liste.\n"),
+            ("liste", "✅ Si le dossier ne s’ouvre pas, cliquer sur Rafraîchir puis réessayer.\n"),
+            ("liste", "✅ Si le dossier ne s’ouvre toujours pas, demander de l’aide avec le nom du chantier.\n"),
+            ("liste", "✅ Après ouverture d’un Excel depuis ce dossier, revenir dans Horizon pour Sauvegarde PDF Historique.\n"),
+
+            ("section", "\n🔎 Dossier administratif\n"),
+            ("liste", "✅ Si le dossier ne s’ouvre pas, revenir à Ce chantier pour accéder aux documents.\n"),
+            ("liste", "✅ Si le document manque, demander de l’aide avec le nom du chantier.\n"),
+
+            ("section", "\n📄 Cahier des charges administratif\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Si le PDF ne s’ouvre pas, vérifier l’application PDF par défaut du poste.\n"),
+
+            ("section", "\n🛠 Cahier des charges technique\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+
+            ("section", "\n📐 Postes / Métré\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+
+            ("section", "\n🦺 Plan de sécurité (PSS)\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+
+            ("section", "\n📄 Décompte intempéries\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, vérifier l’application associée aux fichiers .doc.\n"),
+
+            ("section", "\n📅 Planning d’exécution\n"),
+            ("liste", "✅ Si le planning ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Enregistrer Excel avant de créer la Sauvegarde PDF Historique.\n"),
+            ("liste", "❌ Ne pas modifier les formules ou la structure du planning.\n"),
+
+            ("section", "\n🔎 Coût de la sécurité\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Modifier uniquement les zones prévues puis enregistrer.\n"),
+
+            ("section", "\n📐 Formule de révision\n"),
+            ("liste", "✅ Si le document ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Si Excel bloque les macros ou l’ouverture, suivre le message Excel sans modifier le fichier.\n"),
+
+            ("section", "\n💰 Prix de revient\n"),
+            ("liste", "✅ Si le PR ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Enregistrer le PR avant Vérifier PR ou Calcul / Reca.\n"),
+            ("liste", "✅ En cas de doute sur une valeur, ne pas modifier les formules et demander confirmation.\n"),
+            ("liste", "❌ Ne pas modifier les formules, bibliothèques ou validations.\n"),
+
+            ("section", "\n🔍 Vérifier PR\n"),
+            ("liste", "✅ Enregistrer le PR dans Excel avant de cliquer sur Vérifier PR.\n"),
+            ("liste", "✅ Si un message apparaît, lire le message et reprendre uniquement les zones de saisie prévues.\n"),
+            ("liste", "✅ Si le fichier est verrouillé, fermer Excel puis relancer l’action.\n"),
+            ("liste", "❌ Ne pas modifier une formule pour changer un résultat.\n"),
+
+            ("section", "\n⚙️ Calcul / Reca\n"),
+            ("liste", "✅ Vérifier que le bon chantier est sélectionné.\n"),
+            ("liste", "✅ Enregistrer le PR et l’état d’avancement avant de cliquer.\n"),
+            ("liste", "✅ Si l’action ne se termine pas, fermer Excel puis relancer une seule fois.\n"),
+            ("liste", "✅ Si le problème continue, noter le message affiché et demander de l’aide.\n"),
+
+            ("section", "\n📊 État d'avancement\n"),
+            ("liste", "✅ Si l’état ne s’ouvre pas, essayer d’abord Ce chantier.\n"),
+            ("liste", "✅ Enregistrer Excel avant Calcul état ou Clôturer état.\n"),
+            ("liste", "✅ La synthèse reste libre pour les ajustements métier prévus.\n"),
+            ("liste", "❌ Ne pas écrire dans les cellules de calcul pour forcer un total.\n"),
+
+            ("section", "\n📊 Calcul état\n"),
+            ("liste", "✅ Enregistrer l’état d’avancement dans Excel avant de cliquer.\n"),
+            ("liste", "✅ Si un résultat paraît anormal, ne pas toucher aux formules : contrôler uniquement les zones de saisie prévues ou demander de l’aide.\n"),
+            ("liste", "✅ Relancer une seule fois après avoir enregistré Excel.\n"),
+            ("liste", "❌ Ne pas modifier les formules.\n"),
+
+            ("section", "\n♻️ Clôturer état\n"),
+            ("liste", "✅ Utiliser ce bouton uniquement quand la période est validée.\n"),
+            ("danger", "⚠️⚠️ ATTENTION - OPÉRATION IRRÉVERSIBLE ⚠️⚠️\n"),
+            ("danger", "Clôturer état remet à zéro l’état d’avancement pour préparer l’état suivant.\n"),
+            ("liste", "✅ Avant toute clôture, vérifier que l’état d’avancement est terminé et enregistré.\n"),
+            ("liste", "✅ Créer une Sauvegarde PDF Historique du document.\n"),
+            ("liste", "✅ Vérifier que le PDF a bien été créé dans Historique_Sauvegardes.\n"),
+            ("liste", "✅ Seulement ensuite, lancer Clôturer état.\n"),
+            ("danger", "Sans PDF Historique, les quantités du mois sont remises à zéro et l’état précédent n’est plus récupérable sous sa forme de travail.\n"),
+            ("danger", "Aucune clôture ne doit être réalisée sans cette sauvegarde préalable.\n"),
+            ("liste", "✅ Vérifier que le bon chantier et le bon état sont sélectionnés.\n"),
+
+            ("section", "\n🧭 Pilotage\n"),
+            ("liste", "✅ Enregistrer les fichiers Excel concernés avant de cliquer.\n"),
+            ("liste", "✅ Si la synthèse paraît incorrecte, vérifier que les documents concernés ont bien été enregistrés.\n"),
+
+            ("section", "\n📊 Pilotage délai\n"),
+            ("liste", "✅ Vérifier que les données délai/planning sont à jour et enregistrées.\n"),
+            ("liste", "✅ Si le résultat paraît faux, vérifier que le document délai/planning est enregistré puis demander de l’aide si nécessaire.\n"),
+
+            ("section", "\n⏱ Rendements\n"),
+            ("liste", "✅ Vérifier que les données de rendement sont enregistrées.\n"),
+            ("liste", "✅ Si les heures ou écarts semblent faux, vérifier que le document de rendement est enregistré puis demander de l’aide si nécessaire.\n"),
+
+            ("section", "\nProblèmes généraux d’ouverture de documents\n"),
+            ("liste", "✅ Vérifier que le bon chantier est sélectionné.\n"),
+            ("liste", "✅ Essayer d’ouvrir le document avec Ce chantier.\n"),
+            ("liste", "✅ Vérifier qu’aucune fenêtre Excel ne bloque l’ouverture.\n"),
+            ("liste", "✅ Fermer Excel puis relancer l’ouverture depuis Horizon si nécessaire.\n"),
+
+            ("section", "\nProblèmes généraux liés aux fichiers Excel\n"),
+            ("liste", "⚠️ Si Excel signale un fichier en lecture seule, vérifier qu’il n’est pas déjà ouvert ailleurs.\n"),
+            ("liste", "⚠️ Si Excel demande une récupération, enregistrer une copie avant toute manipulation risquée.\n"),
+            ("liste", "✅ Ne modifier que les zones de saisie prévues.\n"),
+            ("liste", "❌ Ne jamais supprimer une feuille, une colonne, une validation ou une formule.\n"),
+            ("liste", "❌ Ne pas enregistrer un fichier métier sous un autre nom sans consigne.\n"),
+
+            ("section", "\nFenêtre de rappel PDF\n"),
+            ("liste", "✅ Le rappel apparaît lors de l’ouverture d’un document de travail depuis le flux habituel.\n"),
+            ("liste", "✅ Avec Ce chantier, le rappel s’affiche après l’ouverture du dossier afin de rappeler la sauvegarde PDF avant le travail Excel.\n"),
+            ("liste", "✅ La fenêtre reste affichée jusqu’au clic sur ✓ OK, j’ai compris.\n"),
+            ("liste", "🔍 Si elle est derrière une autre fenêtre, revenir sur Horizon ou vérifier le côté de l’écran.\n"),
+
+            ("section", "\nCellules protégées ou formules invisibles\n"),
+            ("liste", "✅ Les cellules contenant des formules sont protégées pour éviter les erreurs de manipulation.\n"),
+            ("liste", "✅ Les formules peuvent être masquées dans la barre de formule lorsque la feuille est protégée.\n"),
+            ("liste", "✅ Les zones de saisie prévues restent modifiables.\n"),
+            ("liste", "✅ La synthèse de l’état d’avancement reste libre pour les ajustements métier prévus.\n"),
+            ("liste", "❌ Ne pas enlever les protections pour travailler plus vite.\n"),
+
+            ("section", "\nErreurs courantes\n"),
+            ("liste", "❌ Travailler sur le mauvais chantier sélectionné.\n"),
+            ("liste", "❌ Oublier d’enregistrer Excel avant un calcul ou un PDF Historique.\n"),
+            ("liste", "❌ Ouvrir plusieurs fichiers Excel et laisser le mauvais classeur actif avant la sauvegarde PDF.\n"),
+            ("liste", "❌ Renommer un fichier utilisé par Horizon.\n"),
+            ("liste", "❌ Copier-coller sur des cellules de calcul.\n"),
+            ("liste", "❌ Modifier le dossier Modèles pour intervenir sur un chantier existant.\n"),
+
+            ("section", "\nProcédure générale en cas de blocage\n"),
+            ("liste", "1. Arrêter les modifications hasardeuses.\n"),
+            ("liste", "2. Identifier le chantier sélectionné et le fichier concerné.\n"),
+            ("liste", "3. Enregistrer Excel si possible.\n"),
+            ("liste", "4. Créer une Sauvegarde PDF Historique si le document est lisible et important.\n"),
+            ("liste", "5. Fermer les boîtes de dialogue Excel puis relancer une seule fois l’action.\n"),
+            ("liste", "6. Si le problème persiste, noter le message affiché, le bouton utilisé et le nom du chantier.\n"),
+            ("danger", "❌ Ne jamais modifier une formule, une validation, une feuille ou une structure pour dépanner dans l’urgence.\n"),
+            ("fin", "\nFin du dépannage complet.\n"),
         ]
 
         def afficher_aide(*_):
             texte.configure(state="normal")
             texte.delete("1.0", "end")
 
-            if aide_var.get() == "Dépannage PR":
-                contenu = contenu_depannage_pr
+            if aide_var.get() == "Aide en cas de blocage":
+                contenu = contenu_depannage_complet
             else:
                 contenu = contenu_mode_emploi
 
@@ -1186,6 +1936,7 @@ class HorizonChantierApp(tk.Tk):
 
         feuille = "Bordereau"
 
+        _backup_excel_before_write(chemin)
         wb = load_workbook(chemin, keep_vba=True)
         ws = wb[feuille]
 
@@ -1291,6 +2042,7 @@ class HorizonChantierApp(tk.Tk):
 
         
 
+        _protect_formula_cells(wb, chemin)
         wb.save(chemin)
         print("Etat recalculé")
 
@@ -1298,6 +2050,9 @@ class HorizonChantierApp(tk.Tk):
        
 
     def mise_a_zero_etat(self):
+        if not self._confirmer_cloture_etat():
+            return
+
         nom_chantier = self._nom_chantier_selectionne()
         if not nom_chantier:
             return
@@ -1309,6 +2064,7 @@ class HorizonChantierApp(tk.Tk):
 
         feuille = "Bordereau"
 
+        _backup_excel_before_write(chemin)
         wb = load_workbook(chemin, keep_vba=True)
         ws = wb[feuille]
 
@@ -1365,6 +2121,7 @@ class HorizonChantierApp(tk.Tk):
             ws[f"P{ligne}"] = ws[f"R{ligne}"].value
             ws[f"Q{ligne}"] = 0
 
+        _protect_formula_cells(wb, chemin)
         wb.save(chemin)
         self.calcul_etat_avancement()
         print("Clôture état effectuée")
@@ -1488,7 +2245,14 @@ class HorizonChantierApp(tk.Tk):
             if val in (None, "", "-", "—"):
                 return 0
             try:
-                return float(str(val).replace("€", "").replace(" ", "").replace(",", "."))
+                texte_nombre = str(val)
+                texte_nombre = texte_nombre.replace("€", "")
+                texte_nombre = texte_nombre.replace("−", "-")
+                texte_nombre = texte_nombre.replace(" ", "")
+                texte_nombre = texte_nombre.replace("\xa0", "")
+                texte_nombre = texte_nombre.replace("\u202f", "")
+                texte_nombre = texte_nombre.replace(",", ".")
+                return float(texte_nombre)
             except:
                 return 0
 
@@ -1557,18 +2321,36 @@ class HorizonChantierApp(tk.Tk):
         revision, _ligne_revision, _col_revision = valeur_soumission_publique(
             ["montant de la révision", "montant de la revision"]
         )
+        revision_globale = revision
         _montant_global, _ligne_global, _col_global = valeur_soumission_publique(
             ["montant global à facturer", "montant global a facturer"]
         )
 
         if "Avenants" in wb.sheetnames:
             ws_avenants = wb["Avenants"]
-            avenants_plus = nombre(ws_avenants["D62"].value)
-            avenants_moins = nombre(ws_avenants["E62"].value)
-            total_marche = nombre(ws_avenants["E65"].value)
+            avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
+                ws_avenants,
+                nombre,
+            )
         else:
             avenants_moins = 0
-            total_marche = montant_soumission + avenants_plus - avenants_moins
+            chemin_avenants = Path(chemin).with_name("Avenants.xlsx")
+            if chemin_avenants.exists():
+                wb_avenants = load_workbook(chemin_avenants, data_only=True)
+                ws_avenants = wb_avenants["Avenants"] if "Avenants" in wb_avenants.sheetnames else wb_avenants.active
+                avenants_plus, avenants_moins = _lire_synthese_avenants_pilotage(
+                    ws_avenants,
+                    nombre,
+                )
+                wb_avenants.close()
+        total_marche = montant_soumission + avenants_plus - avenants_moins
+
+        chemin_revision_globale = Path(chemin).with_name("Revision_global.xlsx")
+        if chemin_revision_globale.exists():
+            wb_revision_globale = load_workbook(chemin_revision_globale, data_only=True)
+            ws_revision_globale = wb_revision_globale.active
+            revision_globale = _lire_revision_globale_pilotage(ws_revision_globale, nombre)
+            wb_revision_globale.close()
 
         print("avenants_plus =", avenants_plus)
         print("avenants_moins =", avenants_moins)
@@ -1582,7 +2364,7 @@ class HorizonChantierApp(tk.Tk):
         realise_mois = total_mois
         realise_cumule = total_realise
         production_mois = realise_mois + revision
-        production_cumulee = realise_cumule + revision
+        production_cumulee = realise_cumule + revision_globale
         reste_a_facturer = total_marche - production_cumulee
         avancement = 0 if total_marche == 0 else (production_cumulee / total_marche) * 100
 
@@ -3170,7 +3952,11 @@ class HorizonChantierApp(tk.Tk):
             return
         dossier_chantier = self._dossier_depuis_json(p)
         try:
+            pr_path = dossier_chantier / "data" / "prix_de_revient.xlsx"
+            if not self._preparer_ouverture_document(pr_path):
+                return
             open_pr(dossier_chantier)
+            self._planifier_rappel_pdf_historique_ouverture()
         except Exception as e:
             messagebox.showerror("Prix de revient", str(e))
 
@@ -3182,7 +3968,11 @@ class HorizonChantierApp(tk.Tk):
     def recherche_matiere(self) -> None:
         try:
             pr_path, hint = self._pr_path_and_hint()
+            if not self._preparer_ouverture_document(pr_path):
+                return
+            _prepare_excel_file_before_write(pr_path)
             subprocess.run(["open", str(pr_path)], check=False)
+            self._planifier_rappel_pdf_historique_ouverture()
             time.sleep(0.3)
 
             items = read_biblio_colA_openpyxl(pr_path, "Bibliothèque_Matière")
@@ -3202,7 +3992,11 @@ class HorizonChantierApp(tk.Tk):
     def recherche_mo(self) -> None:
         try:
             pr_path, hint = self._pr_path_and_hint()
+            if not self._preparer_ouverture_document(pr_path):
+                return
+            _prepare_excel_file_before_write(pr_path)
             subprocess.run(["open", str(pr_path)], check=False)
+            self._planifier_rappel_pdf_historique_ouverture()
             time.sleep(0.3)
 
             items = read_biblio_colA_openpyxl(pr_path, "Bibliothèque_MainOeuvre")
@@ -3290,6 +4084,7 @@ class HorizonChantierApp(tk.Tk):
         wb_pr = load_workbook(chemin_pr, data_only=True)
         ws_pr = wb_pr["Chiffrage"]
 
+        _backup_excel_before_write(chemin_etat)
         wb_etat = load_workbook(chemin_etat, keep_vba=True)
         ws_etat = wb_etat["Bordereau"]
         nb_importes = 0
@@ -3369,6 +4164,7 @@ class HorizonChantierApp(tk.Tk):
                     ws_etat[f"L{row}"] = prix
                 nb_importes += 1
 
+        _protect_formula_cells(wb_etat, chemin_etat)
         wb_etat.save(chemin_etat)
         wb_pr.close()
         wb_etat.close()
@@ -3395,7 +4191,12 @@ class HorizonChantierApp(tk.Tk):
         if not p:
             messagebox.showwarning("Chantier", "Sélectionne un chantier dans la liste.")
             return
-        ouvrir_dossier(self._dossier_depuis_json(p))
+        dossier = self._dossier_depuis_json(p)
+        if not self._preparer_ouverture_document(dossier):
+            return
+        ouvrir_dossier(dossier)
+        if self._doit_rappeler_pdf_historique(dossier):
+            self._planifier_rappel_pdf_historique_ouverture()
 
     def nouveau_chantier(self) -> None:
         win = tk.Toplevel(self)
@@ -3457,7 +4258,10 @@ class HorizonChantierApp(tk.Tk):
 
             try:
                 dossier_path.mkdir(parents=True, exist_ok=False)
-                (dossier_path / "data").mkdir(exist_ok=True)
+                modeles_path = base / "Modèles"
+                if not modeles_path.exists():
+                    raise FileNotFoundError(f"Dossier modèles introuvable : {modeles_path}")
+                shutil.copytree(modeles_path, dossier_path, dirs_exist_ok=True)
                 ecrire_json(json_path, chantier)
                 self.refresh_liste()
                 if self.tree.exists(str(json_path)):
