@@ -280,7 +280,23 @@ def _montant_diminution_avenant(montant: float) -> float:
     return abs(montant)
 
 
+def _normaliser_dossier_data(dossier_chantier: Path) -> Path:
+    data_path = dossier_chantier / "data"
+    if not dossier_chantier.exists() or data_path.exists():
+        return data_path
+
+    for candidat in dossier_chantier.iterdir():
+        if candidat.is_dir() and candidat.name.strip() == "data":
+            candidat.rename(data_path)
+            return data_path
+
+    return data_path
+
+
 def _chemin_fichier_chantier(dossier_chantier: Path, nom_fichier: str) -> Path:
+    if Path(nom_fichier).parts and Path(nom_fichier).parts[0].strip() == "data":
+        _normaliser_dossier_data(dossier_chantier)
+
     chemin = dossier_chantier / nom_fichier
     if dossier_chantier.exists():
         for candidat in dossier_chantier.iterdir():
@@ -617,7 +633,7 @@ def montant_en_lettres_fr(valeur: float) -> str:
 # ============================================================
 def open_pr(chantier_dir: str | Path):
     chantier = Path(chantier_dir)
-    pr = chantier / "data" / "prix_de_revient.xlsx"
+    pr = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     if not pr.exists():
         raise FileNotFoundError(f"PR introuvable : {pr}")
     subprocess.run(["open", str(pr)], check=False)
@@ -625,7 +641,7 @@ def open_pr(chantier_dir: str | Path):
 
 def inject_pv(chantier_dir: str | Path) -> int:
     chantier = Path(chantier_dir)
-    pr_path = chantier / "data" / "prix_de_revient.xlsx"
+    pr_path = _normaliser_dossier_data(chantier) / "prix_de_revient.xlsx"
     pv_path = chantier / PV_SOURCE
 
     if not pr_path.exists():
@@ -2210,7 +2226,7 @@ class HorizonChantierApp(tk.Tk):
             return
 
         dossier_chantier = self._dossier_chantier_selectionne()
-        chemin = dossier_chantier / "data" / "prix_de_revient.xlsx"
+        chemin = _normaliser_dossier_data(dossier_chantier) / "prix_de_revient.xlsx"
 
         import os
         from datetime import datetime
@@ -4016,7 +4032,7 @@ class HorizonChantierApp(tk.Tk):
         if not p:
             raise ValueError("Sélectionne un chantier dans la liste.")
         dossier_chantier = self._dossier_depuis_json(p)
-        pr_path = dossier_chantier / "data" / "prix_de_revient.xlsx"
+        pr_path = _normaliser_dossier_data(dossier_chantier) / "prix_de_revient.xlsx"
         if not pr_path.exists():
             raise FileNotFoundError(f"PR introuvable : {pr_path}")
         hint = pr_path.name
@@ -4029,7 +4045,7 @@ class HorizonChantierApp(tk.Tk):
             return
         dossier_chantier = self._dossier_depuis_json(p)
         try:
-            pr_path = dossier_chantier / "data" / "prix_de_revient.xlsx"
+            pr_path = _normaliser_dossier_data(dossier_chantier) / "prix_de_revient.xlsx"
             if not self._preparer_ouverture_document(pr_path):
                 return
             open_pr(dossier_chantier)
@@ -4105,7 +4121,7 @@ class HorizonChantierApp(tk.Tk):
             return
 
         dossier = self._dossier_chantier_selectionne()
-        chemin_pr = dossier / "data" / "prix_de_revient.xlsx"
+        chemin_pr = _normaliser_dossier_data(dossier) / "prix_de_revient.xlsx"
 
         if not chemin_pr.exists():
             messagebox.showwarning(
@@ -4148,7 +4164,7 @@ class HorizonChantierApp(tk.Tk):
 
     def importer_pr_dans_etat(self):
         dossier = self._dossier_chantier_selectionne()
-        chemin_pr = dossier / "data" / "prix_de_revient.xlsx"
+        chemin_pr = _normaliser_dossier_data(dossier) / "prix_de_revient.xlsx"
 
         try:
             chemin_etat = next(dossier.glob("Etat_avancement*.xlsm"))
@@ -4278,12 +4294,13 @@ class HorizonChantierApp(tk.Tk):
     def nouveau_chantier(self) -> None:
         win = tk.Toplevel(self)
         win.title("Nouveau chantier")
-        win.geometry("820x260")
+        win.geometry("820x320")
         win.resizable(False, False)
 
         client_var = tk.StringVar(value="")
         chantier_var = tk.StringVar(value="")
         adresse_var = tk.StringVar(value="")
+        type_etat_var = tk.StringVar(value="Privé")
 
         frame = ttk.Frame(win, padding=14)
         frame.grid(row=0, column=0, sticky="nsew")
@@ -4301,6 +4318,12 @@ class HorizonChantierApp(tk.Tk):
         ttk.Label(frame, text="Adresse").grid(row=4, column=0, sticky="w")
         e_adresse = ttk.Entry(frame, textvariable=adresse_var, width=90)
         e_adresse.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 12))
+
+        ttk.Label(frame, text="Type d'état d'avancement").grid(row=6, column=0, sticky="w")
+        choix_etat = ttk.Frame(frame)
+        choix_etat.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 12))
+        ttk.Radiobutton(choix_etat, text="Privé", variable=type_etat_var, value="Privé").pack(side="left", padx=(0, 18))
+        ttk.Radiobutton(choix_etat, text="Public", variable=type_etat_var, value="Public").pack(side="left")
 
         def valider():
             nom_client = e_client.get().strip()
@@ -4338,7 +4361,28 @@ class HorizonChantierApp(tk.Tk):
                 modeles_path = base / "Modèles"
                 if not modeles_path.exists():
                     raise FileNotFoundError(f"Dossier modèles introuvable : {modeles_path}")
-                shutil.copytree(modeles_path, dossier_path, dirs_exist_ok=True)
+                nom_modele_etat = (
+                    "Etat_avancement_Public.xlsm"
+                    if type_etat_var.get() == "Public"
+                    else "Etat_avancement_Privé.xlsm"
+                )
+                modele_etat = modeles_path / nom_modele_etat
+                if not modele_etat.exists():
+                    raise FileNotFoundError(f"Modèle état d'avancement introuvable : {modele_etat}")
+
+                def ignorer_etats_avancement(src, names):
+                    if Path(src) == modeles_path:
+                        return [name for name in names if name.startswith("Etat_avancement") and name.endswith(".xlsm")]
+                    return []
+
+                shutil.copytree(modeles_path, dossier_path, dirs_exist_ok=True, ignore=ignorer_etats_avancement)
+                shutil.copy2(modele_etat, dossier_path / nom_modele_etat)
+                data_path = _normaliser_dossier_data(dossier_path)
+                data_path.mkdir(exist_ok=True)
+                pr_modele = modeles_path / "prix_de_revient.xlsx"
+                pr_data = data_path / "prix_de_revient.xlsx"
+                if pr_modele.exists() and not pr_data.exists():
+                    shutil.copy2(pr_modele, pr_data)
                 ecrire_json(json_path, chantier)
                 self.refresh_liste()
                 if self.tree.exists(str(json_path)):
@@ -4353,7 +4397,7 @@ class HorizonChantierApp(tk.Tk):
             win.destroy()
 
         btns = ttk.Frame(frame)
-        btns.grid(row=6, column=0, columnspan=2, sticky="e")
+        btns.grid(row=8, column=0, columnspan=2, sticky="e")
         ttk.Button(btns, text="Annuler", command=win.destroy).pack(side="right")
         ttk.Button(btns, text="Valider", command=valider).pack(side="right", padx=(0, 8))
 
